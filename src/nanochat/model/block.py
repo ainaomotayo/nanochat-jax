@@ -1,29 +1,44 @@
-"""Pre-norm transformer block for the nanochat-jax decoder.
+"""Pre-norm transformer block with nanochat-faithful extensions.
 
-This module implements :class:`TransformerBlock`, a single decoder layer
-that follows the pre-norm residual pattern used in LLaMA, Gemma, and
-other modern open-weight language models:
+Faithful nanochat port extends the standard pre-norm block with:
 
-.. code-block:: text
+1. **Per-layer scalars**: Learnable scalar weights (alpha_attn, alpha_ffn)
+   applied to the attention and FFN outputs before the residual addition.
+   Initialized to 1.0. These allow the model to learn the optimal
+   contribution of each sub-layer independently.
 
-    x = x + Attention(Norm(x))
-    x = x + FFN(Norm(x))
+2. **Smear / Backout token mixing**: Optional causal token-mixing applied
+   before attention (smear blends each token with its predecessor) and
+   corrective backout applied to the attention output.
 
-The block supports:
+3. **Value embeddings**: Optional per-token value lookup added to the
+   attention output. Requires token_ids to be passed through.
 
-- **Grouped-query attention** via :class:`GroupedQueryAttention`.
-- **Configurable feed-forward networks**: SwiGLU, GeGLU, or standard MLP,
-  selected at construction time through :attr:`ModelConfig.ffn_type`.
-- **Gradient checkpointing** (``jax.checkpoint`` / ``jax.remat``):
-  enabled by setting the class attribute ``use_remat = True`` on the
-  block *before* the forward pass, which trades compute for memory
-  during backpropagation.
+The full forward pass with all nanochat features enabled::
+
+    # Smear: blend x with predecessor
+    x_smear, x_prev = smear(x)
+
+    # Pre-norm attention
+    attn_out, kv_cache = attention(norm(x_smear), ...)
+
+    # Backout: remove smear residual from attn output
+    attn_out = backout(attn_out, x_prev)
+
+    # Value embedding injection
+    attn_out = attn_out + value_embed(token_ids)
+
+    # Residual with learnable scalar
+    x = x + alpha_attn * attn_out
+
+    # Pre-norm FFN
+    ffn_out = ffn(norm(x))
+    x = x + alpha_ffn * ffn_out
 
 References:
-    - Pre-norm residual: Xiong et al., "On Layer Normalization in the
-      Transformer Architecture" (2020)
-    - Gradient checkpointing: Chen et al., "Training Deep Nets with
-      Sublinear Memory Cost" (2016)
+    - Pre-norm residual: Xiong et al. (2020)
+    - Per-layer scalars: nanochat, MAGNETO (Wang et al., 2022)
+    - Smear/Backout: nanochat architecture
 """
 
 from __future__ import annotations
@@ -38,43 +53,39 @@ from flax import nnx
 from nanochat.config.model_config import ModelConfig
 from nanochat.model.norms import RMSNorm
 from nanochat.model.attention import GroupedQueryAttention
-from nanochat.model.feedforward import SwiGLUFFN, GeGLUFFN, StandardMLP
+from nanochat.model.feedforward import (
+    ReLUSquaredMLP, SwiGLUFFN, GeGLUFFN, StandardMLP,
+)
+from nanochat.model.value_embeddings import ValueEmbedding
+from nanochat.model.token_mixing import Smear, Backout
 
 log = structlog.get_logger(__name__)
 
-
-# Mapping from config string to feed-forward class
 _FFN_REGISTRY: dict[str, type] = {
+    "relu2": ReLUSquaredMLP,
     "swiglu": SwiGLUFFN,
     "geglu": GeGLUFFN,
-    "mlp": StandardMLP,
+    "gelu": StandardMLP,
 }
 
 
 class TransformerBlock(nnx.Module):
-    """Pre-norm transformer block: ``x = x + Attn(Norm(x))``, ``x = x + FFN(Norm(x))``.
-
-    Each block contains two sub-layers with independent RMSNorm
-    normalization and residual connections.  The attention sub-layer
-    uses grouped-query attention with rotary position embeddings, while
-    the feed-forward sub-layer is selected from the ``_FFN_REGISTRY``
-    based on the :attr:`ModelConfig.ffn_type` string.
+    """Pre-norm transformer block with nanochat extensions.
 
     Attributes:
-        layer_idx: Zero-based index of this block within the stack.
-        use_remat: Class-level flag; when ``True``, the forward
-            computation is wrapped in ``jax.checkpoint`` to reduce
-            activation memory at the cost of recomputation.
-        attn_norm: Pre-attention RMSNorm.
-        ffn_norm: Pre-FFN RMSNorm.
-        attention: Grouped-query attention sub-layer.
-        ffn: Feed-forward sub-layer (SwiGLU, GeGLU, or MLP).
+        layer_idx: Zero-based layer index.
+        use_remat: Enable gradient checkpointing via jax.checkpoint.
+        attn_norm: Pre-attention RMSNorm (parameterless).
+        ffn_norm: Pre-FFN RMSNorm (parameterless).
+        attention: GroupedQueryAttention with QK norm, softcap, window.
+        ffn: Feed-forward network (relu² by default).
+        alpha_attn: Learnable scalar on attention output.
+        alpha_ffn: Learnable scalar on FFN output.
+        smear: Optional causal token-mixing (before attention).
+        backout: Optional corrective mixing (after attention).
+        value_embed: Optional per-token value embedding.
     """
 
-    # Set to True on the *class* (or per-instance) to enable gradient
-    # checkpointing.  This is toggled externally (e.g. by the training
-    # harness) rather than being a constructor argument so that the
-    # parameter pytree is identical with and without remat.
     use_remat: bool = False
 
     def __init__(
@@ -82,45 +93,78 @@ class TransformerBlock(nnx.Module):
         cfg: ModelConfig,
         layer_idx: int,
         *,
+        value_embed: Optional[ValueEmbedding] = None,
         rngs: nnx.Rngs,
     ) -> None:
-        """Initialize a single transformer block.
+        """Initialize TransformerBlock.
 
         Args:
-            cfg: Model architecture configuration.
-            layer_idx: Zero-based layer index (used for logging and
-                potential per-layer hyperparameter scheduling).
+            cfg: Model configuration.
+            layer_idx: Zero-based index of this block.
+            value_embed: Shared ValueEmbedding module (created once in
+                TransformerLM and passed to all blocks). None if
+                cfg.use_value_embeddings is False.
             rngs: Flax NNX RNG container.
 
         Raises:
-            ValueError: If ``cfg.ffn_type`` is not in the FFN registry.
+            ValueError: If cfg.ffn_type is not in the FFN registry.
         """
         if cfg.ffn_type not in _FFN_REGISTRY:
             available = ", ".join(sorted(_FFN_REGISTRY.keys()))
             raise ValueError(
-                f"Unknown ffn_type '{cfg.ffn_type}'. "
-                f"Available types: {available}"
+                f"Unknown ffn_type '{cfg.ffn_type}'. Available: {available}"
             )
 
         self.layer_idx = layer_idx
+        self.cfg_use_smear = cfg.use_smear
+        self.cfg_use_value_embed = cfg.use_value_embeddings
+        self.cfg_use_scalars = cfg.use_per_layer_scalars
 
-        # -- Pre-norm layers ------------------------------------------------
+        # -- Normalization (parameterless RMSNorm) -------------------------
         self.attn_norm = RMSNorm(cfg.d_model, cfg.norm_eps, rngs=rngs)
         self.ffn_norm = RMSNorm(cfg.d_model, cfg.norm_eps, rngs=rngs)
 
-        # -- Attention sub-layer -------------------------------------------
+        # -- Attention -------------------------------------------------------
         self.attention = GroupedQueryAttention(cfg, rngs=rngs)
 
-        # -- Feed-forward sub-layer ----------------------------------------
+        # -- FFN -------------------------------------------------------------
         ffn_cls = _FFN_REGISTRY[cfg.ffn_type]
         self.ffn = ffn_cls(cfg, rngs=rngs)
+
+        # -- Per-layer scalars -----------------------------------------------
+        # Initialize to 1.0 (identity behavior at init).
+        # These become effective after a few gradient steps.
+        if cfg.use_per_layer_scalars:
+            self.alpha_attn = nnx.Param(jnp.ones(()))  # scalar
+            self.alpha_ffn = nnx.Param(jnp.ones(()))   # scalar
+        else:
+            self.alpha_attn = None  # type: ignore[assignment]
+            self.alpha_ffn = None   # type: ignore[assignment]
+
+        # -- Smear / Backout -------------------------------------------------
+        if cfg.use_smear:
+            self.smear = Smear(cfg.d_model, rngs=rngs)
+            self.backout = Backout(cfg.d_model, rngs=rngs)
+        else:
+            self.smear = None   # type: ignore[assignment]
+            self.backout = None  # type: ignore[assignment]
+
+        # -- Value embedding (shared, passed in from TransformerLM) ----------
+        # Not owned by this block — just a reference for forward-pass lookup.
+        self._value_embed = value_embed
 
         log.debug(
             "transformer_block.init",
             layer_idx=layer_idx,
             ffn_type=cfg.ffn_type,
-            use_remat=self.use_remat,
+            use_smear=cfg.use_smear,
+            use_scalars=cfg.use_per_layer_scalars,
+            use_value_embed=cfg.use_value_embeddings and value_embed is not None,
         )
+
+    # ------------------------------------------------------------------
+    # Forward pass
+    # ------------------------------------------------------------------
 
     def __call__(
         self,
@@ -130,33 +174,28 @@ class TransformerBlock(nnx.Module):
         mask: Optional[jax.Array],
         kv_cache: Optional[Tuple[jax.Array, jax.Array]] = None,
         deterministic: bool = True,
+        token_ids: Optional[jax.Array] = None,
     ) -> Tuple[jax.Array, Optional[Tuple[jax.Array, jax.Array]]]:
         """Forward pass through the transformer block.
 
         Args:
-            x: Input hidden states of shape ``(batch, seq_len, d_model)``.
-            cos: RoPE cosine frequencies of shape
-                ``(seq_len, d_head // 2)``.
-            sin: RoPE sine frequencies of shape
-                ``(seq_len, d_head // 2)``.
-            mask: Attention mask of shape ``(1, 1, seq_len, seq_total)``
-                or ``(batch, 1, seq_len, seq_total)``.  ``True``/``1``
-                positions are attended to; ``False``/``0`` are masked out.
-            kv_cache: Optional tuple ``(cached_k, cached_v)`` from a
-                previous forward pass for incremental decoding.
-            deterministic: When ``True``, dropout is disabled.
+            x: Hidden states ``(batch, seq_len, d_model)``.
+            cos: RoPE cosines ``(seq_len, d_head // 2)``.
+            sin: RoPE sines ``(seq_len, d_head // 2)``.
+            mask: Attention mask ``(1_or_B, 1, seq_len, seq_total)``.
+            kv_cache: Optional KV cache for incremental decoding.
+            deterministic: When True, disables dropout.
+            token_ids: Integer token IDs ``(batch, seq_len)`` required for
+                value embeddings. Can be None if use_value_embeddings=False.
 
         Returns:
-            A tuple ``(output, new_kv_cache)`` where *output* has shape
-            ``(batch, seq_len, d_model)`` and *new_kv_cache* is the
-            updated key/value cache (or ``None`` if caching is disabled
-            in the attention layer).
+            ``(output, new_kv_cache)`` where output has the same shape as x.
         """
         if self.use_remat:
             return self._forward_with_remat(
-                x, cos, sin, mask, kv_cache, deterministic
+                x, cos, sin, mask, kv_cache, deterministic, token_ids
             )
-        return self._forward(x, cos, sin, mask, kv_cache, deterministic)
+        return self._forward(x, cos, sin, mask, kv_cache, deterministic, token_ids)
 
     def _forward(
         self,
@@ -166,30 +205,61 @@ class TransformerBlock(nnx.Module):
         mask: Optional[jax.Array],
         kv_cache: Optional[Tuple[jax.Array, jax.Array]],
         deterministic: bool,
+        token_ids: Optional[jax.Array],
     ) -> Tuple[jax.Array, Optional[Tuple[jax.Array, jax.Array]]]:
-        """Core forward logic without gradient checkpointing.
+        """Core forward logic (no gradient checkpointing)."""
 
-        This is factored out so that ``_forward_with_remat`` can wrap it
-        with ``jax.checkpoint``.
-        """
-        # --- Pre-norm attention with residual ---
+        # ----------------------------------------------------------------
+        # Attention sub-layer
+        # ----------------------------------------------------------------
         residual = x  # [B, S, d_model]
-        x_normed = self.attn_norm(x)  # [B, S, d_model]
+
+        # Smear: blend x with causal predecessor before normalization
+        x_prev = None
+        x_for_attn = x
+        if self.smear is not None:
+            x_for_attn, x_prev = self.smear(x)
+
+        # Pre-norm
+        x_normed = self.attn_norm(x_for_attn)  # [B, S, d_model]
+
+        # Attention
         attn_out, new_kv_cache = self.attention(
-            x_normed,
-            cos,
-            sin,
-            mask,
-            kv_cache=kv_cache,
-            deterministic=deterministic,
-        )  # attn_out: [B, S, d_model]
-        x = residual + attn_out  # [B, S, d_model]
+            x_normed, cos, sin, mask,
+            kv_cache=kv_cache, deterministic=deterministic,
+        )  # [B, S, d_model]
 
-        # --- Pre-norm FFN with residual ---
-        residual = x  # [B, S, d_model]
+        # Backout: remove smear residual from attention output
+        if self.backout is not None and x_prev is not None:
+            attn_out = self.backout(attn_out, x_prev)
+
+        # Value embedding injection (token-specific static residual)
+        if self._value_embed is not None and token_ids is not None:
+            v_embed = self._value_embed(token_ids)  # [B, S, d_model]
+            attn_out = attn_out + v_embed
+
+        # Residual with per-layer scalar
+        if self.alpha_attn is not None:
+            x = residual + self.alpha_attn.get_value() * attn_out
+        else:
+            x = residual + attn_out
+
+        # ----------------------------------------------------------------
+        # FFN sub-layer
+        # ----------------------------------------------------------------
+        residual = x
+
+        # Pre-norm
         x_normed = self.ffn_norm(x)  # [B, S, d_model]
+
+        # FFN
         ffn_out = self.ffn(x_normed, deterministic=deterministic)  # [B, S, d_model]
-        x = residual + ffn_out  # [B, S, d_model]
+
+        # Residual with per-layer scalar
+        if self.alpha_ffn is not None:
+            x = residual + self.alpha_ffn.get_value() * ffn_out
+        else:
+            x = residual + ffn_out
 
         return x, new_kv_cache
 
@@ -201,57 +271,41 @@ class TransformerBlock(nnx.Module):
         mask: Optional[jax.Array],
         kv_cache: Optional[Tuple[jax.Array, jax.Array]],
         deterministic: bool,
+        token_ids: Optional[jax.Array],
     ) -> Tuple[jax.Array, Optional[Tuple[jax.Array, jax.Array]]]:
-        """Forward pass wrapped in ``jax.checkpoint`` for gradient checkpointing.
+        """Forward pass with jax.checkpoint for gradient checkpointing.
 
-        During the backward pass, intermediate activations will be
-        recomputed rather than stored, reducing peak memory at the cost
-        of ~33% additional compute.
+        During backpropagation, intermediate activations are recomputed
+        rather than stored, reducing peak memory by ~33%.
+
+        Note: KV cache is computed outside the checkpoint boundary so it
+        is accessible during inference without re-triggering remat.
         """
 
         @jax.checkpoint
-        def _checkpointed_forward(
+        def _checkpointed(
             x_in: jax.Array,
             cos_in: jax.Array,
             sin_in: jax.Array,
+            token_ids_in: Optional[jax.Array],
         ) -> jax.Array:
-            """Checkpointed portion: attention + FFN (no cache for remat)."""
-            # Pre-norm attention
-            x_normed = self.attn_norm(x_in)  # [B, S, d_model]
-            attn_out, _ = self.attention(
-                x_normed,
-                cos_in,
-                sin_in,
-                mask,
-                kv_cache=None,
-                deterministic=deterministic,
-            )  # [B, S, d_model]
-            h = x_in + attn_out  # [B, S, d_model]
+            x_out, _ = self._forward(
+                x_in, cos_in, sin_in, mask, None, deterministic, token_ids_in
+            )
+            return x_out
 
-            # Pre-norm FFN
-            h_normed = self.ffn_norm(h)  # [B, S, d_model]
-            ffn_out = self.ffn(
-                h_normed, deterministic=deterministic
-            )  # [B, S, d_model]
-            h = h + ffn_out  # [B, S, d_model]
-            return h
+        output = _checkpointed(x, cos, sin, token_ids)
 
-        # When using remat during training we ignore the KV cache
-        # (caching is only used during inference, where remat is off).
-        output = _checkpointed_forward(x, cos, sin)
-
-        # Still compute the KV cache outside the checkpoint boundary
-        # so it can be used for inference if the caller requests it.
-        # During training with remat, kv_cache is typically None.
+        # Compute KV cache outside the checkpoint boundary (inference only).
         if kv_cache is not None:
-            x_normed = self.attn_norm(x)
+            x_prev = None
+            x_for_attn = x
+            if self.smear is not None:
+                x_for_attn, x_prev = self.smear(x)
+            x_normed = self.attn_norm(x_for_attn)
             _, new_kv_cache = self.attention(
-                x_normed,
-                cos,
-                sin,
-                mask,
-                kv_cache=kv_cache,
-                deterministic=deterministic,
+                x_normed, cos, sin, mask,
+                kv_cache=kv_cache, deterministic=deterministic,
             )
         else:
             new_kv_cache = None
@@ -261,5 +315,7 @@ class TransformerBlock(nnx.Module):
     def __repr__(self) -> str:
         return (
             f"TransformerBlock(layer_idx={self.layer_idx}, "
-            f"use_remat={self.use_remat})"
+            f"ffn_type={type(self.ffn).__name__}, "
+            f"smear={self.smear is not None}, "
+            f"scalars={self.alpha_attn is not None})"
         )

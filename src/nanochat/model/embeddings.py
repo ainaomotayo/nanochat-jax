@@ -125,8 +125,8 @@ class TokenEmbedding(nnx.Module):
             Logit tensor of shape ``(batch, seq_len, vocab_size)``.
         """
         # hidden: [batch, seq_len, d_model]
-        # self.embed.embedding.value: [vocab_size, d_model]
-        weight = self.embed.embedding.value  # [vocab_size, d_model]
+        # self.embed.embedding: [vocab_size, d_model]
+        weight = self.embed.embedding.get_value()  # [vocab_size, d_model]
         logits = hidden @ weight.T  # [batch, seq_len, vocab_size]
         return logits
 

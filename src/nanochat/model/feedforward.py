@@ -1,45 +1,20 @@
 """Feed-forward network variants for the nanochat-jax transformer.
 
-This module provides three drop-in-replaceable FFN implementations:
+Faithful nanochat port default: ReLUSquaredMLP using relu²(x) = x * relu(x).
 
-- :class:`SwiGLUFFN`: Gated Linear Unit with SiLU (Swish) activation.
-  Used by LLaMA, Mistral, and most modern LLMs. The default for nanochat.
-- :class:`GeGLUFFN`: Gated Linear Unit with GELU activation.
-  Used by PaLM and some T5 variants.
-- :class:`StandardMLP`: Classical two-layer MLP with GELU activation.
-  Used by GPT-2, BERT, and earlier transformers.
+Activation comparison:
+- **relu²**: x * relu(x) = relu(x)² for x≥0, 0 for x<0. Smooth, non-saturating,
+  efficient (no gating branch needed). nanochat default.
+- **SwiGLU**: silu(gate) * up. Requires 3 projections. Used by LLaMA/Mistral.
+- **GeGLU**: gelu(gate) * up. Similar to SwiGLU.
+- **StandardMLP**: GELU on single projection. Classic GPT-2 style.
 
-All three classes share identical ``__init__`` and ``__call__`` signatures
-so they can be swapped without code changes.
-
-**Gated FFN Architecture (SwiGLU / GeGLU)**::
-
-    x ----+-----> gate_proj ----> activation ---+
-          |                                     |---> element-wise multiply ---> down_proj ---> dropout ---> out
-          +-----> up_proj ----------------------+
-
-**Standard MLP Architecture**::
-
-    x ----> fc1 ----> GELU ----> dropout ----> fc2 ----> dropout ----> out
-
-**Parameter Count Comparison** (for d_model=D, d_ff=F):
-
-+-------------+----------------+---------------------------------------+
-| Variant     | Parameters     | Notes                                 |
-+=============+================+=======================================+
-| SwiGLU/GeGLU| 3 * D * F      | gate_proj + up_proj + down_proj       |
-+-------------+----------------+---------------------------------------+
-| Standard MLP| 2 * D * F      | fc1 + fc2 (plus biases if enabled)    |
-+-------------+----------------+---------------------------------------+
-
-To compensate, gated variants typically use d_ff = round(2/3 * 4D) instead
-of d_ff = 4D, making total parameters roughly equivalent while improving
-quality.
+All classes share identical ``__init__``/``__call__`` signatures for
+drop-in replacement.
 
 References:
+    - relu²: So et al., "Primer: Searching for Efficient Transformers" (2021)
     - SwiGLU: Shazeer, "GLU Variants Improve Transformer" (2020)
-    - GELU: Hendrycks & Gimpel, "Gaussian Error Linear Units (GELUs)" (2016)
-    - GeGLU: Shazeer, "GLU Variants Improve Transformer" (2020)
 """
 
 from __future__ import annotations
@@ -58,391 +33,196 @@ log = structlog.get_logger(__name__)
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
-    """Round *value* up to the nearest multiple of *multiple*.
-
-    Parameters
-    ----------
-    value:
-        The integer value to round.
-    multiple:
-        The alignment boundary (must be positive).
-
-    Returns
-    -------
-    int
-        The smallest integer >= *value* that is divisible by *multiple*.
-    """
     return math.ceil(value / multiple) * multiple
 
 
-def _compute_gated_d_ff(d_model: int, d_ff: Optional[int]) -> int:
-    """Compute the intermediate dimension for gated FFN variants.
-
-    If ``d_ff`` is already specified, returns it directly. Otherwise
-    computes the standard SwiGLU/GeGLU intermediate size:
-    ``round_up(2/3 * 4 * d_model, 256)``.
-
-    Args:
-        d_model: Model hidden dimension.
-        d_ff: Explicit intermediate dimension, or ``None`` for auto-compute.
-
-    Returns:
-        The intermediate feed-forward dimension.
-    """
-    if d_ff is not None:
-        return d_ff
-    raw = int(2.0 / 3.0 * 4 * d_model)
-    return _round_up_to_multiple(raw, 256)
-
-
-def _compute_standard_d_ff(d_model: int, d_ff: Optional[int]) -> int:
-    """Compute the intermediate dimension for standard MLP.
-
-    If ``d_ff`` is already specified, returns it directly. Otherwise
-    uses the classical ``4 * d_model``.
-
-    Args:
-        d_model: Model hidden dimension.
-        d_ff: Explicit intermediate dimension, or ``None`` for auto-compute.
-
-    Returns:
-        The intermediate feed-forward dimension.
-    """
-    if d_ff is not None:
-        return d_ff
-    return 4 * d_model
-
-
 # ---------------------------------------------------------------------------
-# SwiGLU Feed-Forward Network
+# relu² MLP — nanochat default
 # ---------------------------------------------------------------------------
 
 
-class SwiGLUFFN(nnx.Module):
-    """Gated feed-forward network with SiLU (Swish) activation.
+class ReLUSquaredMLP(nnx.Module):
+    """Two-layer MLP with relu²(x) = x * relu(x) activation.
 
-    Implements the SwiGLU variant from Shazeer (2020), which is the
-    default FFN in LLaMA, Mistral, and most modern decoder-only LLMs.
+    This is the nanochat-faithful FFN variant. Unlike gated FFNs (SwiGLU,
+    GeGLU), it uses only two linear projections, making it computationally
+    equivalent to a standard MLP with the same d_ff.
 
-    The forward pass computes::
+    Architecture::
 
-        gate = silu(gate_proj(x))       # [B, S, d_ff]
-        up   = up_proj(x)               # [B, S, d_ff]
-        out  = down_proj(gate * up)     # [B, S, d_model]
-        out  = dropout(out)
+        x ---> fc1 ---> relu²(·) ---> fc2 ---> dropout ---> out
 
-    The element-wise gating (``gate * up``) allows the network to learn
-    which features to amplify or suppress, providing better gradient flow
-    than standard ReLU/GELU MLPs.
+    where relu²(x) = x * relu(x) = max(0, x)² (for x > 0), 0 (for x ≤ 0).
 
     Attributes:
-        d_ff: Intermediate (hidden) dimension of the feed-forward network.
-        gate_proj: Linear projection for the gating branch
-            (``d_model -> d_ff``).
-        up_proj: Linear projection for the value branch
-            (``d_model -> d_ff``).
-        down_proj: Linear projection back to model dimension
-            (``d_ff -> d_model``).
-        dropout: Dropout layer applied to the output.
+        d_ff: Intermediate dimension (default: 4 * d_model).
+        fc1: Expansion projection (d_model → d_ff).
+        down_proj: Contraction projection (d_ff → d_model). Alias: fc2.
+        dropout: Output dropout.
     """
 
     def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs) -> None:
-        """Initialize SwiGLUFFN.
+        """Initialize ReLUSquaredMLP.
 
         Args:
-            cfg: Model configuration. Uses ``d_model``, ``d_ff``, and
-                ``dropout_rate``. If ``cfg.d_ff`` is ``None``, it is
-                auto-computed as ``round_up(2/3 * 4 * d_model, 256)``.
-            rngs: Flax NNX RNG container for parameter initialization
-                and dropout randomness.
+            cfg: Model config. Uses d_model, d_ff (auto: 4*d_model), dropout_rate.
+            rngs: Flax NNX RNG container.
         """
-        self.d_ff = _compute_gated_d_ff(cfg.d_model, cfg.d_ff)
+        self.d_ff = cfg.d_ff if cfg.d_ff is not None else 4 * cfg.d_model
 
-        # Gate projection: applies SiLU activation to control information flow
-        # d_model -> d_ff, no bias (standard for gated FFNs)
+        # Expansion: d_model → d_ff
         self.gate_proj = nnx.Linear(
-            cfg.d_model, self.d_ff, use_bias=False, rngs=rngs
+            cfg.d_model, self.d_ff, use_bias=cfg.use_bias, rngs=rngs
         )
 
-        # Up projection: produces the value signal to be gated
-        # d_model -> d_ff, no bias
-        self.up_proj = nnx.Linear(
-            cfg.d_model, self.d_ff, use_bias=False, rngs=rngs
-        )
+        # No up_proj (unlike SwiGLU) — relu² needs only one projection
+        self.up_proj = None  # type: ignore[assignment]
 
-        # Down projection: maps back to model dimension
-        # d_ff -> d_model, no bias
+        # Contraction: d_ff → d_model
         self.down_proj = nnx.Linear(
-            self.d_ff, cfg.d_model, use_bias=False, rngs=rngs
+            self.d_ff, cfg.d_model, use_bias=cfg.use_bias, rngs=rngs
         )
 
-        # Output dropout
         self.dropout = nnx.Dropout(cfg.dropout_rate, rngs=rngs)
 
         log.debug(
-            "swiglu_ffn.init",
+            "relu2_mlp.init",
             d_model=cfg.d_model,
             d_ff=self.d_ff,
             dropout_rate=cfg.dropout_rate,
         )
 
-    def __call__(
-        self,
-        x: jax.Array,
-        deterministic: bool = True,
-    ) -> jax.Array:
-        """Apply SwiGLU feed-forward transformation.
+    def __call__(self, x: jax.Array, deterministic: bool = True) -> jax.Array:
+        """Apply relu² MLP.
 
         Args:
-            x: Input tensor of shape ``(batch, seq_len, d_model)``.
-            deterministic: If ``True``, disables dropout (inference mode).
-                If ``False``, applies dropout (training mode).
+            x: Input tensor of shape (batch, seq_len, d_model).
+            deterministic: If True, disables dropout.
 
         Returns:
-            Output tensor of shape ``(batch, seq_len, d_model)``.
-
-        Shape flow::
-
-            x: [B, S, d_model]
-                |
-            gate_proj -> silu: [B, S, d_ff]
-            up_proj:           [B, S, d_ff]
-                |
-            gate * up:         [B, S, d_ff]
-                |
-            down_proj:         [B, S, d_model]
-                |
-            dropout:           [B, S, d_model]
+            Output tensor of shape (batch, seq_len, d_model).
         """
-        # Gating branch with SiLU (Swish) activation
+        # Expand and apply relu²: x * relu(x)
+        h = self.gate_proj(x)          # [B, S, d_ff]
+        h = h * jax.nn.relu(h)         # relu²: x * max(0, x) — bf16-safe, no saturation
+
+        # Contract
+        out = self.down_proj(h)        # [B, S, d_model]
+        return self.dropout(out, deterministic=deterministic)
+
+    def __repr__(self) -> str:
+        return f"ReLUSquaredMLP(d_ff={self.d_ff})"
+
+
+# ---------------------------------------------------------------------------
+# SwiGLU FFN
+# ---------------------------------------------------------------------------
+
+
+class SwiGLUFFN(nnx.Module):
+    """Gated FFN with SiLU (Swish) activation.
+
+    Architecture::
+
+        gate = silu(gate_proj(x))
+        up   = up_proj(x)
+        out  = down_proj(gate * up)
+
+    Used by LLaMA, Mistral, and most modern decoder-only LLMs.
+    d_ff defaults to round_up(2/3 * 4 * d_model, 256) to equalize
+    parameter count with a standard MLP using 4 * d_model.
+    """
+
+    def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs) -> None:
+        if cfg.d_ff is not None:
+            self.d_ff = cfg.d_ff
+        else:
+            raw = int(2.0 / 3.0 * 4 * cfg.d_model)
+            self.d_ff = _round_up_to_multiple(raw, 256)
+
+        self.gate_proj = nnx.Linear(cfg.d_model, self.d_ff, use_bias=False, rngs=rngs)
+        self.up_proj = nnx.Linear(cfg.d_model, self.d_ff, use_bias=False, rngs=rngs)
+        self.down_proj = nnx.Linear(self.d_ff, cfg.d_model, use_bias=False, rngs=rngs)
+        self.dropout = nnx.Dropout(cfg.dropout_rate, rngs=rngs)
+
+        log.debug("swiglu_ffn.init", d_model=cfg.d_model, d_ff=self.d_ff)
+
+    def __call__(self, x: jax.Array, deterministic: bool = True) -> jax.Array:
         gate = jax.nn.silu(self.gate_proj(x))  # [B, S, d_ff]
-
-        # Value branch (no activation)
-        up = self.up_proj(x)  # [B, S, d_ff]
-
-        # Element-wise gating and down-projection
-        out = self.down_proj(gate * up)  # [B, S, d_model]
-
-        # Apply dropout
-        return self.dropout(out, deterministic=deterministic)  # [B, S, d_model]
+        up = self.up_proj(x)                    # [B, S, d_ff]
+        out = self.down_proj(gate * up)         # [B, S, d_model]
+        return self.dropout(out, deterministic=deterministic)
 
     def __repr__(self) -> str:
         return f"SwiGLUFFN(d_ff={self.d_ff})"
 
 
 # ---------------------------------------------------------------------------
-# GeGLU Feed-Forward Network
+# GeGLU FFN
 # ---------------------------------------------------------------------------
 
 
 class GeGLUFFN(nnx.Module):
-    """Gated feed-forward network with GELU activation.
+    """Gated FFN with GELU activation.
 
-    Implements the GeGLU variant from Shazeer (2020). Identical to
-    :class:`SwiGLUFFN` except the gating branch uses GELU instead of SiLU.
-
-    The forward pass computes::
-
-        gate = gelu(gate_proj(x))       # [B, S, d_ff]
-        up   = up_proj(x)               # [B, S, d_ff]
-        out  = down_proj(gate * up)     # [B, S, d_model]
-        out  = dropout(out)
-
-    Attributes:
-        d_ff: Intermediate (hidden) dimension of the feed-forward network.
-        gate_proj: Linear projection for the gating branch
-            (``d_model -> d_ff``).
-        up_proj: Linear projection for the value branch
-            (``d_model -> d_ff``).
-        down_proj: Linear projection back to model dimension
-            (``d_ff -> d_model``).
-        dropout: Dropout layer applied to the output.
+    Identical to SwiGLUFFN but with GELU instead of SiLU gating.
     """
 
     def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs) -> None:
-        """Initialize GeGLUFFN.
+        if cfg.d_ff is not None:
+            self.d_ff = cfg.d_ff
+        else:
+            raw = int(2.0 / 3.0 * 4 * cfg.d_model)
+            self.d_ff = _round_up_to_multiple(raw, 256)
 
-        Args:
-            cfg: Model configuration. Uses ``d_model``, ``d_ff``, and
-                ``dropout_rate``. If ``cfg.d_ff`` is ``None``, it is
-                auto-computed as ``round_up(2/3 * 4 * d_model, 256)``.
-            rngs: Flax NNX RNG container for parameter initialization
-                and dropout randomness.
-        """
-        self.d_ff = _compute_gated_d_ff(cfg.d_model, cfg.d_ff)
-
-        # Gate projection: applies GELU activation to control information flow
-        # d_model -> d_ff, no bias
-        self.gate_proj = nnx.Linear(
-            cfg.d_model, self.d_ff, use_bias=False, rngs=rngs
-        )
-
-        # Up projection: produces the value signal to be gated
-        # d_model -> d_ff, no bias
-        self.up_proj = nnx.Linear(
-            cfg.d_model, self.d_ff, use_bias=False, rngs=rngs
-        )
-
-        # Down projection: maps back to model dimension
-        # d_ff -> d_model, no bias
-        self.down_proj = nnx.Linear(
-            self.d_ff, cfg.d_model, use_bias=False, rngs=rngs
-        )
-
-        # Output dropout
+        self.gate_proj = nnx.Linear(cfg.d_model, self.d_ff, use_bias=False, rngs=rngs)
+        self.up_proj = nnx.Linear(cfg.d_model, self.d_ff, use_bias=False, rngs=rngs)
+        self.down_proj = nnx.Linear(self.d_ff, cfg.d_model, use_bias=False, rngs=rngs)
         self.dropout = nnx.Dropout(cfg.dropout_rate, rngs=rngs)
 
-        log.debug(
-            "geglu_ffn.init",
-            d_model=cfg.d_model,
-            d_ff=self.d_ff,
-            dropout_rate=cfg.dropout_rate,
-        )
+        log.debug("geglu_ffn.init", d_model=cfg.d_model, d_ff=self.d_ff)
 
-    def __call__(
-        self,
-        x: jax.Array,
-        deterministic: bool = True,
-    ) -> jax.Array:
-        """Apply GeGLU feed-forward transformation.
-
-        Args:
-            x: Input tensor of shape ``(batch, seq_len, d_model)``.
-            deterministic: If ``True``, disables dropout (inference mode).
-                If ``False``, applies dropout (training mode).
-
-        Returns:
-            Output tensor of shape ``(batch, seq_len, d_model)``.
-
-        Shape flow::
-
-            x: [B, S, d_model]
-                |
-            gate_proj -> gelu: [B, S, d_ff]
-            up_proj:           [B, S, d_ff]
-                |
-            gate * up:         [B, S, d_ff]
-                |
-            down_proj:         [B, S, d_model]
-                |
-            dropout:           [B, S, d_model]
-        """
-        # Gating branch with GELU activation
-        gate = jax.nn.gelu(self.gate_proj(x))  # [B, S, d_ff]
-
-        # Value branch (no activation)
-        up = self.up_proj(x)  # [B, S, d_ff]
-
-        # Element-wise gating and down-projection
-        out = self.down_proj(gate * up)  # [B, S, d_model]
-
-        # Apply dropout
-        return self.dropout(out, deterministic=deterministic)  # [B, S, d_model]
+    def __call__(self, x: jax.Array, deterministic: bool = True) -> jax.Array:
+        gate = jax.nn.gelu(self.gate_proj(x))
+        up = self.up_proj(x)
+        out = self.down_proj(gate * up)
+        return self.dropout(out, deterministic=deterministic)
 
     def __repr__(self) -> str:
         return f"GeGLUFFN(d_ff={self.d_ff})"
 
 
 # ---------------------------------------------------------------------------
-# Standard MLP Feed-Forward Network
+# Standard GELU MLP
 # ---------------------------------------------------------------------------
 
 
 class StandardMLP(nnx.Module):
     """Classical two-layer MLP with GELU activation.
 
-    Implements the original transformer feed-forward network used in
-    GPT-2, BERT, and other early transformers.
+    Architecture::
 
-    The forward pass computes::
-
-        out = fc2(gelu(fc1(x)))         # [B, S, d_model]
-        out = dropout(out)
-
-    Unlike the gated variants (:class:`SwiGLUFFN`, :class:`GeGLUFFN`),
-    this MLP has no gating mechanism and uses only two linear projections
-    instead of three, resulting in fewer parameters for the same ``d_ff``.
-
-    Attributes:
-        d_ff: Intermediate (hidden) dimension of the feed-forward network.
-        fc1: First linear projection (``d_model -> d_ff``).
-        fc2: Second linear projection (``d_ff -> d_model``).
-        dropout: Dropout layer applied to the output.
+        out = fc2(gelu(fc1(x)))
     """
 
     def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs) -> None:
-        """Initialize StandardMLP.
+        self.d_ff = cfg.d_ff if cfg.d_ff is not None else 4 * cfg.d_model
 
-        Args:
-            cfg: Model configuration. Uses ``d_model``, ``d_ff``, and
-                ``dropout_rate``. If ``cfg.d_ff`` is ``None``, it defaults
-                to ``4 * d_model``.
-            rngs: Flax NNX RNG container for parameter initialization
-                and dropout randomness.
-        """
-        self.d_ff = _compute_standard_d_ff(cfg.d_model, cfg.d_ff)
-
-        # First projection: expand to intermediate dimension
-        # d_model -> d_ff, uses bias following GPT-2 convention
         self.gate_proj = nnx.Linear(
             cfg.d_model, self.d_ff, use_bias=cfg.use_bias, rngs=rngs
         )
-
-        # Unused but kept for interface compatibility with gated variants.
-        # StandardMLP does not have a separate up_proj or gating mechanism.
-        # We alias fc1/fc2 as gate_proj/down_proj below for compatibility,
-        # but provide fc1/fc2 properties for clarity.
         self.up_proj = None  # type: ignore[assignment]
-
-        # Second projection: contract back to model dimension
-        # d_ff -> d_model
         self.down_proj = nnx.Linear(
             self.d_ff, cfg.d_model, use_bias=cfg.use_bias, rngs=rngs
         )
-
-        # Output dropout
         self.dropout = nnx.Dropout(cfg.dropout_rate, rngs=rngs)
 
-        log.debug(
-            "standard_mlp.init",
-            d_model=cfg.d_model,
-            d_ff=self.d_ff,
-            dropout_rate=cfg.dropout_rate,
-        )
+        log.debug("standard_mlp.init", d_model=cfg.d_model, d_ff=self.d_ff)
 
-    def __call__(
-        self,
-        x: jax.Array,
-        deterministic: bool = True,
-    ) -> jax.Array:
-        """Apply standard MLP feed-forward transformation.
-
-        Args:
-            x: Input tensor of shape ``(batch, seq_len, d_model)``.
-            deterministic: If ``True``, disables dropout (inference mode).
-                If ``False``, applies dropout (training mode).
-
-        Returns:
-            Output tensor of shape ``(batch, seq_len, d_model)``.
-
-        Shape flow::
-
-            x: [B, S, d_model]
-                |
-            fc1 (gate_proj) -> gelu:  [B, S, d_ff]
-                |
-            fc2 (down_proj):          [B, S, d_model]
-                |
-            dropout:                  [B, S, d_model]
-        """
-        # Expand to intermediate dimension with GELU activation
+    def __call__(self, x: jax.Array, deterministic: bool = True) -> jax.Array:
         hidden = jax.nn.gelu(self.gate_proj(x))  # [B, S, d_ff]
-
-        # Contract back to model dimension
-        out = self.down_proj(hidden)  # [B, S, d_model]
-
-        # Apply dropout
-        return self.dropout(out, deterministic=deterministic)  # [B, S, d_model]
+        out = self.down_proj(hidden)              # [B, S, d_model]
+        return self.dropout(out, deterministic=deterministic)
 
     def __repr__(self) -> str:
         return f"StandardMLP(d_ff={self.d_ff})"

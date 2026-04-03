@@ -32,6 +32,8 @@ class KVCache:
         new_k, new_v: [batch, n_kv_heads, seq_new, d_head]
         """
         seq_new = new_k.shape[2]
+        new_k = new_k.astype(self.keys.dtype)
+        new_v = new_v.astype(self.values.dtype)
         keys = jax.lax.dynamic_update_slice(
             self.keys, new_k, (0, 0, self.position, 0)
         )

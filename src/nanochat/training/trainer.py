@@ -100,9 +100,13 @@ class Trainer:
                 batch["input_ids"],
                 deterministic=False,
             )
+            # Causal LM: logit[t] predicts token[t+1]
+            # logits[:, :-1, :] → predictions at positions 0..S-2
+            # labels[:, 1:]    → targets at positions 1..S-1
+            labels_src = batch["labels"] if "labels" in batch else batch["input_ids"]
             loss, metrics = cross_entropy_loss(
                 logits=logits[:, :-1, :],
-                labels=batch["labels"][:, :-1] if "labels" in batch else batch["input_ids"][:, 1:],
+                labels=labels_src[:, 1:],
             )
             return loss, metrics
 
@@ -137,10 +141,10 @@ class Trainer:
 
         for batch in self.val_loader:
             logits, _ = self.model(batch["input_ids"], deterministic=True)
-            labels = batch.get("labels", batch["input_ids"][:, 1:])
+            labels_src = batch.get("labels", batch["input_ids"])
             loss, metrics = cross_entropy_loss(
                 logits=logits[:, :-1, :],
-                labels=labels if labels.shape[1] == logits.shape[1] - 1 else labels[:, :-1],
+                labels=labels_src[:, 1:],
             )
             total_loss += float(loss) * float(metrics["n_tokens"])
             total_tokens += float(metrics["n_tokens"])

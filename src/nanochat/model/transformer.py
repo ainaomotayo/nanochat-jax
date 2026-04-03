@@ -1,31 +1,28 @@
-"""Decoder-only transformer language model for nanochat-jax.
+"""Decoder-only transformer language model — nanochat-faithful port.
 
-This module implements :class:`TransformerLM`, the top-level model that
-composes token embeddings, rotary position encodings, a stack of
-:class:`TransformerBlock` layers, and a language-modelling head into a
-complete autoregressive language model.
-
-Architecture overview:
-
-.. code-block:: text
+Architecture::
 
     input_ids -> TokenEmbedding -> [TransformerBlock x N] -> RMSNorm -> LM Head -> logits
 
-Key features:
+nanochat-faithful implementation:
+- Parameterless RMSNorm (no gamma)
+- relu² MLP activation
+- QK L2 normalization + 1.2x scale factor
+- Logit softcap (30.0) in attention
+- Per-layer alpha scalars on attention and FFN outputs
+- Smear/Backout causal token mixing
+- Shared value embedding table injected at each block
+- Depth-aware weight initialization (from_depth style)
+- rope_base = 100000
+- Untied input/output embeddings (default)
 
-- **Weight tying**: when ``cfg.tie_embeddings`` is ``True``, the output
-  projection reuses the token embedding matrix (no separate ``lm_head``).
-- **GPT-NeoX-style initialization**: output projection weights in
-  attention and FFN sub-layers are scaled by ``1 / sqrt(2 * n_layers)``
-  to stabilize training at depth.
-- **KV caching**: each layer returns an updated cache for efficient
-  autoregressive generation.
-- **Gradient checkpointing**: can be enabled per-layer by setting
-  ``TransformerBlock.use_remat = True``.
+Weight initialization (nanochat from_depth style):
+    At layer l (0-indexed), the residual projections (out_proj, down_proj)
+    are scaled by 1 / sqrt(2 * (l + 1)). This prevents the residual
+    stream variance from growing with depth, regardless of total n_layers.
 
-References:
-    - GPT-NeoX: Black et al., "GPT-NeoX-20B: An Open-Source Autoregressive
-      Language Model" (2022)
+    This is more principled than GPT-NeoX's global 1/sqrt(2*n_layers)
+    because it accounts for the actual depth at each layer.
 """
 
 from __future__ import annotations
@@ -42,79 +39,75 @@ from nanochat.config.model_config import ModelConfig
 from nanochat.model.embeddings import TokenEmbedding, RotaryEmbedding
 from nanochat.model.norms import RMSNorm
 from nanochat.model.block import TransformerBlock
+from nanochat.model.value_embeddings import ValueEmbedding
 
 log = structlog.get_logger(__name__)
 
 
 class TransformerLM(nnx.Module):
-    """Decoder-only transformer language model.
-
-    Combines token embeddings, rotary position encodings, a stack of
-    pre-norm transformer blocks, and a (possibly weight-tied) language
-    modelling head.
+    """Nanochat-faithful decoder-only transformer language model.
 
     Attributes:
         cfg: Frozen model configuration.
-        embed: Token embedding layer with optional weight-tied logit
-            projection.
-        rope: Rotary position embedding utility (not an nnx.Module).
-        layers: List of :class:`TransformerBlock` decoder layers.
-        final_norm: Final RMSNorm applied before the LM head.
-        lm_head: Output linear projection (only present when
-            ``cfg.tie_embeddings`` is ``False``).
+        embed: Token embedding layer.
+        rope: Rotary position embedding utility.
+        value_embed: Optional shared value embedding table.
+        layers: Stack of TransformerBlock decoder layers.
+        final_norm: Parameterless RMSNorm before LM head.
+        lm_head: Output linear projection (when tie_embeddings=False).
     """
 
     def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs) -> None:
-        """Initialize the full transformer language model.
+        """Initialize TransformerLM.
 
         Args:
-            cfg: Model architecture configuration specifying dimensions,
-                layer count, attention layout, FFN type, and more.
-            rngs: Flax NNX RNG container used for all sub-module
-                parameter initialization.
-
-        Raises:
-            ValueError: Propagated from sub-modules if the configuration
-                contains invalid combinations.
+            cfg: Model architecture configuration.
+            rngs: Flax NNX RNG container.
         """
         self.cfg = cfg
 
         # -- Token embedding ------------------------------------------------
         self.embed = TokenEmbedding(
-            cfg.vocab_size,
-            cfg.d_model,
-            cfg.init_std,
-            rngs=rngs,
+            cfg.vocab_size, cfg.d_model, cfg.init_std, rngs=rngs,
         )
 
-        # -- Rotary position embedding (pure-JAX utility, no parameters) ----
-        self.rope = RotaryEmbedding(
-            cfg.d_head,
-            cfg.max_seq_len,
-            cfg.rope_base,
-        )
+        # -- Rotary position embedding (no parameters) ----------------------
+        self.rope = RotaryEmbedding(cfg.d_head, cfg.max_seq_len, cfg.rope_base)
+
+        # -- Shared value embedding table -----------------------------------
+        # Single table shared across all layers to keep parameter count bounded.
+        # Blocks receive a reference to this table (not a copy).
+        if cfg.use_value_embeddings:
+            self.value_embed = ValueEmbedding(
+                cfg.vocab_size, cfg.d_model, rngs=rngs,
+            )
+        else:
+            self.value_embed = None  # type: ignore[assignment]
 
         # -- Transformer block stack ----------------------------------------
-        # nnx.List is required for Flax NNX pytree traversal of module lists
         self.layers = nnx.List([
-            TransformerBlock(cfg, layer_idx=i, rngs=rngs)
+            TransformerBlock(
+                cfg,
+                layer_idx=i,
+                value_embed=self.value_embed,
+                rngs=rngs,
+            )
             for i in range(cfg.n_layers)
         ])
 
-        # -- Final normalization --------------------------------------------
+        # -- Final RMSNorm --------------------------------------------------
         self.final_norm = RMSNorm(cfg.d_model, cfg.norm_eps, rngs=rngs)
 
-        # -- LM head (only when embeddings are not tied) --------------------
+        # -- LM head --------------------------------------------------------
         if not cfg.tie_embeddings:
             self.lm_head = nnx.Linear(
-                cfg.d_model,
-                cfg.vocab_size,
-                use_bias=False,
-                rngs=rngs,
+                cfg.d_model, cfg.vocab_size, use_bias=False, rngs=rngs,
             )
+        else:
+            self.lm_head = None  # type: ignore[assignment]
 
-        # -- Apply GPT-NeoX-style weight initialization ---------------------
-        self._init_weights()
+        # -- Depth-aware weight initialization ------------------------------
+        self._init_weights_from_depth()
 
         log.info(
             "transformer_lm.init",
@@ -124,9 +117,15 @@ class TransformerLM(nnx.Module):
             n_heads=cfg.n_heads,
             n_kv_heads=cfg.n_kv_heads,
             d_ff=cfg.d_ff,
-            tie_embeddings=cfg.tie_embeddings,
             ffn_type=cfg.ffn_type,
-            max_seq_len=cfg.max_seq_len,
+            tie_embeddings=cfg.tie_embeddings,
+            use_qk_norm=cfg.use_qk_norm,
+            logit_softcap=cfg.logit_softcap,
+            use_value_embeddings=cfg.use_value_embeddings,
+            use_per_layer_scalars=cfg.use_per_layer_scalars,
+            use_smear=cfg.use_smear,
+            sliding_window_size=cfg.sliding_window_size,
+            rope_base=cfg.rope_base,
         )
 
     # ------------------------------------------------------------------
@@ -140,118 +139,108 @@ class TransformerLM(nnx.Module):
         attention_mask: Optional[jax.Array] = None,
         deterministic: bool = True,
     ) -> Tuple[jax.Array, List[Optional[Tuple[jax.Array, jax.Array]]]]:
-        """Run the full forward pass of the language model.
+        """Run the full forward pass.
 
         Args:
-            input_ids: Integer token IDs of shape ``(batch, seq_len)``.
-            kv_caches: Optional list of per-layer KV caches for
-                incremental decoding.  Each element is a tuple
-                ``(cached_keys, cached_values)`` or ``None``.
-            attention_mask: Optional boolean/int mask of shape
-                ``(batch, seq_len)`` where ``True``/``1`` marks valid
-                positions and ``False``/``0`` marks padding.
-            deterministic: When ``True``, disables dropout.
+            input_ids: Token IDs ``(batch, seq_len)``.
+            kv_caches: Optional per-layer KV caches for incremental decoding.
+                Each element is ``(k, v)`` or ``None``.
+            attention_mask: Optional boolean/int mask ``(batch, seq_len)``
+                where True/1 marks valid positions.
+            deterministic: When True, disables dropout.
 
         Returns:
-            A tuple ``(logits, new_kv_caches)`` where:
-
-            - *logits* has shape ``(batch, seq_len, vocab_size)``
-            - *new_kv_caches* is a list of per-layer cache tuples
+            Tuple ``(logits, new_kv_caches)`` where logits has shape
+            ``(batch, seq_len, vocab_size)``.
         """
         B, S = input_ids.shape
 
         # 1. Token embedding
         x = self.embed(input_ids)  # [B, S, d_model]
 
-        # 2. Get RoPE frequencies for this sequence length
-        cos, sin = self.rope.get_freqs(S)  # [S, d_head // 2] each
+        # 2. RoPE frequencies for this sequence length
+        cos, sin = self.rope.get_freqs(S)  # [S, d_head//2]
 
-        # 3. Build causal attention mask [1, 1, S, S_total]
-        #    For standard (non-cached) forward: S_total == S
-        #    For cached decoding: S_total would be larger, but we handle
-        #    that at the attention layer level via kv_cache concatenation.
-        causal = jnp.tril(
-            jnp.ones((S, S), dtype=jnp.bool_)
-        )  # [S, S]
+        # 3. Build causal mask
+        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
         mask = causal[None, None, :, :]  # [1, 1, S, S]
 
-        # Combine with padding mask if provided
         if attention_mask is not None:
-            # attention_mask: [B, S] -> [B, 1, 1, S]
             pad_mask = attention_mask[:, None, None, :]  # [B, 1, 1, S]
-            mask = mask & pad_mask  # [B, 1, S, S] via broadcast
+            mask = mask & pad_mask  # [B, 1, S, S]
 
-        # 4. Forward through transformer block stack
+        # 4. Transformer block stack
         new_kv_caches: list[Optional[Tuple[jax.Array, jax.Array]]] = []
         for i, layer in enumerate(self.layers):
             cache = kv_caches[i] if kv_caches is not None else None
             x, new_cache = layer(
-                x, cos, sin, mask, cache, deterministic
-            )  # x: [B, S, d_model]
+                x, cos, sin, mask, cache, deterministic,
+                token_ids=input_ids,   # for value embeddings
+            )
             new_kv_caches.append(new_cache)
 
-        # 5. Final layer normalization
+        # 5. Final RMSNorm
         x = self.final_norm(x)  # [B, S, d_model]
 
-        # 6. Project to vocabulary logits
-        if self.cfg.tie_embeddings:
-            logits = self.embed.as_logits(x)  # [B, S, vocab_size]
-        else:
+        # 6. LM head
+        if not self.cfg.tie_embeddings:
             logits = self.lm_head(x)  # [B, S, vocab_size]
+        else:
+            logits = self.embed.as_logits(x)  # [B, S, vocab_size]
 
-        # Optional output logit scaling (e.g. Gemma-style)
+        # 7. Optional output logit scaling
         if self.cfg.output_logits_scale is not None:
             logits = logits * self.cfg.output_logits_scale
 
         return logits, new_kv_caches
 
     # ------------------------------------------------------------------
-    # Weight initialization
+    # Weight initialization — nanochat from_depth style
     # ------------------------------------------------------------------
 
-    def _init_weights(self) -> None:
-        """Apply GPT-NeoX-style output-projection scaling.
+    def _init_weights_from_depth(self) -> None:
+        """Apply nanochat from_depth weight initialization.
 
-        Scales the weights of output projection layers (attention
-        ``out_proj`` and FFN ``down_proj``) by ``1 / sqrt(2 * n_layers)``
-        to prevent the residual stream variance from growing with depth.
+        Scales residual output projections (attention out_proj and FFN
+        down_proj) at each layer by 1 / sqrt(2 * (layer_idx + 1)).
 
-        This is called once at the end of ``__init__`` after all
-        sub-modules have been constructed with their default
-        initialization.
+        Rationale:
+            After l layers, the residual stream has accumulated 2*(l+1)
+            additions (one from attention, one from FFN per layer). To
+            keep the variance of the residual stream O(1) at any depth,
+            each addition should contribute O(1/sqrt(2*(l+1))).
+
+            This is strictly more principled than GPT-NeoX's global
+            1/sqrt(2*n_layers) because it adapts to actual depth rather
+            than total depth.
+
+        Effect:
+            Early layers have larger-magnitude residual projections
+            (since the stream is still small). Deep layers have smaller
+            projections to avoid variance blow-up.
         """
-        n_layers = self.cfg.n_layers
-        if n_layers == 0:
-            return
+        for layer_idx, layer in enumerate(self.layers):
+            # Depth-aware scale: 1/sqrt(2*(l+1))
+            depth_scale = 1.0 / math.sqrt(2.0 * (layer_idx + 1))
 
-        output_scale = 1.0 / math.sqrt(2.0 * n_layers)
-
-        for layer in self.layers:
-            # Scale attention output projection
             if hasattr(layer.attention, "out_proj"):
-                _scale_param(layer.attention.out_proj, output_scale)
+                _scale_linear(layer.attention.out_proj, depth_scale)
 
-            # Scale FFN down projection (output projection)
             if hasattr(layer.ffn, "down_proj"):
-                _scale_param(layer.ffn.down_proj, output_scale)
+                _scale_linear(layer.ffn.down_proj, depth_scale)
 
         log.debug(
-            "transformer_lm.init_weights",
-            n_layers=n_layers,
-            output_scale=output_scale,
+            "transformer_lm.init_weights_from_depth",
+            n_layers=self.cfg.n_layers,
+            style="from_depth",
         )
 
     # ------------------------------------------------------------------
-    # Convenience methods
+    # Gradient checkpointing helpers
     # ------------------------------------------------------------------
 
     def enable_gradient_checkpointing(self) -> None:
-        """Enable gradient checkpointing on all transformer blocks.
-
-        This sets ``use_remat = True`` on every :class:`TransformerBlock`
-        in the layer stack, causing their forward passes to be wrapped in
-        ``jax.checkpoint`` during backpropagation.
-        """
+        """Enable gradient checkpointing on all transformer blocks."""
         for layer in self.layers:
             layer.use_remat = True
         log.info(
@@ -281,7 +270,9 @@ class TransformerLM(nnx.Module):
             f"  d_ff={self.cfg.d_ff},\n"
             f"  ffn_type={self.cfg.ffn_type!r},\n"
             f"  tie_embeddings={self.cfg.tie_embeddings},\n"
-            f"  max_seq_len={self.cfg.max_seq_len},\n"
+            f"  use_qk_norm={self.cfg.use_qk_norm},\n"
+            f"  logit_softcap={self.cfg.logit_softcap},\n"
+            f"  rope_base={self.cfg.rope_base},\n"
             f")"
         )
 
@@ -291,13 +282,12 @@ class TransformerLM(nnx.Module):
 # ======================================================================
 
 
-def _scale_param(linear: nnx.Linear, scale: float) -> None:
-    """Scale the kernel of an ``nnx.Linear`` layer in-place.
+def _scale_linear(linear: nnx.Linear, scale: float) -> None:
+    """Scale the kernel of an nnx.Linear layer in-place.
 
     Args:
-        linear: An ``nnx.Linear`` module whose ``kernel`` parameter
-            will be multiplied by *scale*.
-        scale: Multiplicative scaling factor.
+        linear: Linear module whose ``kernel`` parameter is multiplied.
+        scale: Multiplicative factor.
     """
     if hasattr(linear, "kernel"):
-        linear.kernel = nnx.Param(linear.kernel.value * scale)
+        linear.kernel = nnx.Param(linear.kernel.get_value() * scale)

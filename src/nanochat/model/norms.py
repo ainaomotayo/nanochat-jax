@@ -1,12 +1,21 @@
 """Normalization layers for the nanochat-jax transformer.
 
-This module provides RMSNorm and LayerNorm implementations as Flax NNX modules.
-RMSNorm is the preferred normalization for modern LLMs (LLaMA, Gemma, etc.)
-due to its simplicity and comparable performance to LayerNorm.
+Faithful nanochat port: RMSNorm is PARAMETERLESS — no learned scale (gamma).
+This matches nanochat's norm() function exactly:
+
+    y = x / sqrt(mean(x²) + eps)
+
+Design rationale:
+- Removing gamma reduces parameters and eliminates a potential source of
+  training instability at depth.
+- The residual stream magnitude is controlled by weight initialization
+  (from_depth scaling) rather than learned norms.
+- This is a deliberate nanochat departure from LLaMA/Gemma which use
+  learned gamma.
 
 References:
     - RMSNorm: Zhang & Sennrich, "Root Mean Square Layer Normalization" (2019)
-    - LayerNorm: Ba, Kiros & Hinton, "Layer Normalization" (2016)
+    - nanochat: parameterless variant (no affine transform)
 """
 
 from __future__ import annotations
@@ -20,20 +29,21 @@ log = structlog.get_logger(__name__)
 
 
 class RMSNorm(nnx.Module):
-    """Root Mean Square Layer Normalization.
+    """Parameterless Root Mean Square Layer Normalization.
 
-    Normalizes the input by its RMS value and scales by a learnable parameter.
-    Unlike LayerNorm, RMSNorm does not re-center (no mean subtraction or bias),
-    which reduces computation while maintaining effectiveness.
+    Normalizes the input by its RMS value WITHOUT any learnable scale
+    or shift parameters. This is the nanochat-faithful variant.
 
     Formula::
 
-        output = (x / sqrt(mean(x^2, axis=-1, keepdims=True) + eps)) * gamma
+        output = x / sqrt(mean(x², axis=-1, keepdims=True) + eps)
+
+    The computation is promoted to float32 for numerical stability
+    regardless of input dtype, then cast back.
 
     Attributes:
-        d_model: Dimensionality of the input features.
-        eps: Small constant for numerical stability in the denominator.
-        gamma: Learnable scale parameter of shape ``(d_model,)``.
+        d_model: Dimensionality of the input features (stored for repr).
+        eps: Small constant for numerical stability.
     """
 
     def __init__(
@@ -43,90 +53,63 @@ class RMSNorm(nnx.Module):
         *,
         rngs: nnx.Rngs,
     ) -> None:
-        """Initialize RMSNorm.
+        """Initialize parameterless RMSNorm.
 
         Args:
-            d_model: Dimensionality of the input features.
-            eps: Small constant added inside the square root for numerical
-                stability. Defaults to ``1e-6``.
-            rngs: Flax NNX RNG container (required by NNX convention, not
-                consumed by this module).
-
-        Raises:
-            ValueError: If *d_model* is not a positive integer.
+            d_model: Input feature dimensionality (informational; not used
+                in computation since there are no parameters to shape).
+            eps: Stability epsilon added inside the square root.
+            rngs: Flax NNX RNG container (required by convention; unused
+                since this module has no parameters).
         """
         if d_model <= 0:
-            raise ValueError(
-                f"d_model must be a positive integer, got {d_model}"
-            )
+            raise ValueError(f"d_model must be positive, got {d_model}")
 
         self.d_model = d_model
         self.eps = eps
-        self.gamma = nnx.Param(jnp.ones((d_model,)))  # [d_model]
+        # No gamma parameter — this is intentional for nanochat fidelity.
+        # Do NOT add self.gamma here.
 
-        log.debug(
-            "rmsnorm.init",
-            d_model=d_model,
-            eps=eps,
-        )
+        log.debug("rmsnorm.init", d_model=d_model, eps=eps, parameterless=True)
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        """Apply RMSNorm to the input tensor.
-
-        The computation is performed in float32 for numerical stability,
-        regardless of the input dtype. The output is cast back to the
-        original input dtype.
+        """Apply parameterless RMSNorm.
 
         Args:
-            x: Input tensor of shape ``(..., d_model)`` where the last
-                dimension must equal *d_model*.
+            x: Input tensor of shape ``(..., d_model)``.
 
         Returns:
-            Normalized tensor of the same shape and dtype as *x*.
-
-        Raises:
-            ValueError: If the last dimension of *x* does not match *d_model*.
+            RMS-normalized tensor of the same shape and dtype as *x*.
         """
-        input_dtype = x.dtype  # preserve original dtype for output cast
+        input_dtype = x.dtype
 
-        # Upcast to float32 for numerical stability during norm computation
+        # Promote to float32 for numerically stable variance computation.
         x_f32 = x.astype(jnp.float32)  # [..., d_model]
 
-        # Compute mean of squared values along feature dimension
-        mean_sq = jnp.mean(
-            jnp.square(x_f32), axis=-1, keepdims=True
-        )  # [..., 1]
+        # mean(x²) along the feature axis
+        mean_sq = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)  # [..., 1]
 
-        # Compute the reciprocal of the RMS (inverse root mean square)
+        # Reciprocal RMS
         rms_inv = jax.lax.rsqrt(mean_sq + self.eps)  # [..., 1]
 
-        # Normalize and scale by learnable gamma
+        # Normalize — no gamma scaling
         normed = x_f32 * rms_inv  # [..., d_model]
-        scaled = normed * self.gamma.value.astype(jnp.float32)  # [..., d_model]
 
-        # Cast back to input dtype (e.g. bfloat16)
-        return scaled.astype(input_dtype)  # [..., d_model]
+        return normed.astype(input_dtype)
 
     def __repr__(self) -> str:
-        return f"RMSNorm(d_model={self.d_model}, eps={self.eps})"
+        return f"RMSNorm(d_model={self.d_model}, eps={self.eps}, parameterless=True)"
 
 
 class LayerNorm(nnx.Module):
     """Standard Layer Normalization with learnable affine parameters.
 
-    Normalizes the input by subtracting the mean and dividing by the
-    standard deviation, then applies a learnable scale (*gamma*) and
-    shift (*beta*).
+    Retained for completeness and ablation experiments. Not used in the
+    nanochat-faithful default configuration.
 
     Formula::
 
         output = (x - mean(x)) / sqrt(var(x) + eps) * gamma + beta
-
-    Attributes:
-        d_model: Dimensionality of the input features.
-        eps: Small constant for numerical stability.
-        gamma: Learnable scale parameter of shape ``(d_model,)``.
-        beta: Learnable shift parameter of shape ``(d_model,)``.
     """
 
     def __init__(
@@ -136,71 +119,24 @@ class LayerNorm(nnx.Module):
         *,
         rngs: nnx.Rngs,
     ) -> None:
-        """Initialize LayerNorm.
-
-        Args:
-            d_model: Dimensionality of the input features.
-            eps: Small constant added inside the square root for numerical
-                stability. Defaults to ``1e-5``.
-            rngs: Flax NNX RNG container (required by NNX convention, not
-                consumed by this module).
-
-        Raises:
-            ValueError: If *d_model* is not a positive integer.
-        """
         if d_model <= 0:
-            raise ValueError(
-                f"d_model must be a positive integer, got {d_model}"
-            )
+            raise ValueError(f"d_model must be positive, got {d_model}")
 
         self.d_model = d_model
         self.eps = eps
-        self.gamma = nnx.Param(jnp.ones((d_model,)))  # [d_model]
-        self.beta = nnx.Param(jnp.zeros((d_model,)))  # [d_model]
+        self.gamma = nnx.Param(jnp.ones((d_model,)))
+        self.beta = nnx.Param(jnp.zeros((d_model,)))
 
-        log.debug(
-            "layernorm.init",
-            d_model=d_model,
-            eps=eps,
-        )
+        log.debug("layernorm.init", d_model=d_model, eps=eps)
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        """Apply LayerNorm to the input tensor.
-
-        The computation is performed in float32 for numerical stability,
-        regardless of the input dtype. The output is cast back to the
-        original input dtype.
-
-        Args:
-            x: Input tensor of shape ``(..., d_model)`` where the last
-                dimension must equal *d_model*.
-
-        Returns:
-            Normalized tensor of the same shape and dtype as *x*.
-        """
-        input_dtype = x.dtype  # preserve original dtype for output cast
-
-        # Upcast to float32 for numerical stability
-        x_f32 = x.astype(jnp.float32)  # [..., d_model]
-
-        # Compute mean along feature dimension
-        mean = jnp.mean(x_f32, axis=-1, keepdims=True)  # [..., 1]
-
-        # Compute variance along feature dimension
-        var = jnp.mean(
-            jnp.square(x_f32 - mean), axis=-1, keepdims=True
-        )  # [..., 1]
-
-        # Normalize
-        normed = (x_f32 - mean) * jax.lax.rsqrt(var + self.eps)  # [..., d_model]
-
-        # Apply learnable affine transform
-        gamma_f32 = self.gamma.value.astype(jnp.float32)  # [d_model]
-        beta_f32 = self.beta.value.astype(jnp.float32)  # [d_model]
-        output = normed * gamma_f32 + beta_f32  # [..., d_model]
-
-        # Cast back to input dtype
-        return output.astype(input_dtype)  # [..., d_model]
+        input_dtype = x.dtype
+        x_f32 = x.astype(jnp.float32)
+        mean = jnp.mean(x_f32, axis=-1, keepdims=True)
+        var = jnp.mean(jnp.square(x_f32 - mean), axis=-1, keepdims=True)
+        normed = (x_f32 - mean) * jax.lax.rsqrt(var + self.eps)
+        output = normed * self.gamma.get_value().astype(jnp.float32) + self.beta.get_value().astype(jnp.float32)
+        return output.astype(input_dtype)
 
     def __repr__(self) -> str:
         return f"LayerNorm(d_model={self.d_model}, eps={self.eps})"

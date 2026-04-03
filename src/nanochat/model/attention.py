@@ -1,40 +1,32 @@
-"""Grouped-Query Attention for the nanochat-jax transformer.
+"""Grouped-Query Attention with nanochat-faithful extensions.
 
-This module implements :class:`GroupedQueryAttention`, a unified attention
-mechanism that supports Multi-Head Attention (MHA), Multi-Query Attention
-(MQA), and Grouped-Query Attention (GQA) through a single parameterization
-controlled by the ratio ``n_heads / n_kv_heads``.
+Faithful nanochat port adds:
 
-**Attention Variants and Memory Comparison**
+1. **QK normalization**: L2-normalize Q and K per head position before
+   computing attention scores. This bounds dot-product magnitudes and
+   stabilizes training at depth.
 
-+----------+-----------+------------------+-----------------------------+
-| Variant  | n_kv_heads| KV cache / layer | Example                     |
-+==========+===========+==================+=============================+
-| MHA      | = n_heads | 2 * B*S*d_model  | GPT-2, BERT                 |
-+----------+-----------+------------------+-----------------------------+
-| GQA      | < n_heads | 2 * B*S*n_kv*d_h | LLaMA-2 70B (n_kv=8)       |
-|          | > 1       |                  | Reduces KV cache by n_groups|
-+----------+-----------+------------------+-----------------------------+
-| MQA      | = 1       | 2 * B*S*d_head   | PaLM, Falcon                |
-|          |           |                  | Minimal KV cache            |
-+----------+-----------+------------------+-----------------------------+
+2. **QK scale**: Use ``qk_scale_factor / sqrt(d_head)`` instead of the
+   standard ``1 / sqrt(d_head)``. nanochat default: 1.2.
 
-For a model with ``d_model=4096, n_heads=32, d_head=128``:
-- MHA (n_kv=32): KV cache = 2 * 32 * 128 = 8192 floats/token/layer
-- GQA (n_kv=8):  KV cache = 2 *  8 * 128 = 2048 floats/token/layer (4x smaller)
-- MQA (n_kv=1):  KV cache = 2 *  1 * 128 =  256 floats/token/layer (32x smaller)
+3. **Logit softcap**: Apply ``cap * tanh(logits / cap)`` BEFORE softmax
+   to prevent extreme logit spikes. nanochat default: cap=30.0.
 
-GQA provides a good balance: near-MHA quality with significantly reduced
-memory during inference, enabling larger batch sizes and longer contexts.
+4. **Sliding window attention**: Optionally restrict each query to attend
+   only to the last ``window_size`` keys (local attention), with optional
+   leading global tokens that are always attendable.
+
+Attention variants (unchanged from original):
+- MHA:  n_kv_heads == n_heads
+- GQA:  1 < n_kv_heads < n_heads
+- MQA:  n_kv_heads == 1
 
 References:
-    - MHA: Vaswani et al., "Attention Is All You Need" (2017)
-    - MQA: Shazeer, "Fast Transformer Decoding: One Write-Head is All
-      You Need" (2019)
-    - GQA: Ainslie et al., "GQA: Training Generalized Multi-Query
-      Transformer Models from Multi-Head Checkpoints" (2023)
-    - RoPE: Su et al., "RoFormer: Enhanced Transformer with Rotary
-      Position Embedding" (2021)
+    - GQA: Ainslie et al. (2023)
+    - RoPE: Su et al. (2021)
+    - QK norm: Wortsman et al. (2023), Gemma-2 tech report (2024)
+    - Logit softcap: Gemma-2 tech report (2024)
+    - Sliding window: Beltagy et al. (2020), Mistral (2023)
 """
 
 from __future__ import annotations
@@ -53,94 +45,122 @@ from nanochat.model.embeddings import RotaryEmbedding
 log = structlog.get_logger(__name__)
 
 
+def _l2_normalize(x: jax.Array, eps: float = 1e-8) -> jax.Array:
+    """L2-normalize along the last axis.
+
+    Args:
+        x: Input array. Normalization is applied per last-dim vector.
+        eps: Small constant to avoid division by zero.
+
+    Returns:
+        Unit-norm array of the same shape as *x*.
+    """
+    norm = jnp.linalg.norm(x, axis=-1, keepdims=True)
+    return x / (norm + eps)
+
+
+def _build_sliding_window_mask(
+    seq_len: int,
+    window_size: int,
+    n_global_tokens: int = 1,
+) -> jax.Array:
+    """Build a causal sliding-window attention mask.
+
+    Each query at position q can attend to:
+    - All key positions within the window: max(0, q - window_size + 1) ≤ k ≤ q
+    - Global key positions: k < n_global_tokens (always attended regardless of window)
+
+    The result is combined with the standard causal mask so that future
+    positions are never attended to.
+
+    Args:
+        seq_len: Sequence length (both query and key dimension).
+        window_size: Local attention window size in tokens.
+        n_global_tokens: Number of leading tokens treated as global
+            (always-attendable keys).
+
+    Returns:
+        Boolean mask of shape ``(1, 1, seq_len, seq_len)`` where ``True``
+        means "this (q, k) pair is allowed to attend."
+    """
+    q_idx = jnp.arange(seq_len)[:, None]   # [S, 1]
+    k_idx = jnp.arange(seq_len)[None, :]   # [1, S]
+
+    # Standard causal: k ≤ q
+    causal = k_idx <= q_idx
+
+    # Local window: q - window_size < k  (within window)
+    in_window = k_idx > (q_idx - window_size)
+
+    # Global tokens: k < n_global_tokens (always visible)
+    is_global = k_idx < n_global_tokens
+
+    # Combined: (causal AND in_window) OR is_global
+    mask = (causal & in_window) | is_global
+
+    return mask[None, None, :, :]  # [1, 1, S, S]
+
+
 class GroupedQueryAttention(nnx.Module):
-    """Grouped-Query Attention supporting MHA, GQA, and MQA.
+    """Grouped-Query Attention with nanochat extensions.
 
-    This module computes scaled dot-product attention with support for:
-    - Rotary Position Embeddings (RoPE) applied to queries and keys.
-    - KV caching for efficient autoregressive decoding.
-    - Grouped-Query Attention where multiple query heads share a single
-      key/value head, reducing memory and computation.
+    Supports MHA / GQA / MQA through the n_heads / n_kv_heads ratio.
 
-    The attention variant is determined by the relationship between
-    ``n_heads`` (query heads) and ``n_kv_heads`` (key/value heads):
-
-    - ``n_kv_heads == n_heads``: Standard Multi-Head Attention (MHA)
-    - ``1 < n_kv_heads < n_heads``: Grouped-Query Attention (GQA)
-    - ``n_kv_heads == 1``: Multi-Query Attention (MQA)
+    nanochat extensions (all opt-in via ModelConfig):
+    - QK L2 normalization before RoPE
+    - Attention scale = qk_scale_factor / sqrt(d_head)
+    - Logit softcap: cap * tanh(logits / cap)
+    - Sliding window mask with global tokens
 
     Attributes:
-        n_heads: Number of query attention heads.
-        n_kv_heads: Number of key/value attention heads.
-        d_head: Dimensionality of each attention head.
-        n_groups: Number of query heads per key/value head
-            (``n_heads // n_kv_heads``).
-        q_proj: Linear projection for queries
-            (``d_model -> n_heads * d_head``).
-        k_proj: Linear projection for keys
-            (``d_model -> n_kv_heads * d_head``).
-        v_proj: Linear projection for values
-            (``d_model -> n_kv_heads * d_head``).
-        out_proj: Linear projection for output
-            (``n_heads * d_head -> d_model``).
-        dropout: Attention dropout layer.
+        n_heads: Number of query heads.
+        n_kv_heads: Number of key/value heads.
+        d_head: Head dimension.
+        n_groups: n_heads // n_kv_heads.
+        use_qk_norm: Whether to L2-normalize Q and K.
+        attn_scale: Scalar attention scale (qk_scale_factor / sqrt(d_head)).
+        logit_softcap: Softcap value or None.
+        sliding_window_size: Window size or None for full attention.
+        n_global_tokens: Always-visible global token count.
     """
 
     def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs) -> None:
         """Initialize GroupedQueryAttention.
 
-        Creates the four linear projections (Q, K, V, output) and the
-        attention dropout layer. Projection dimensions are derived from
-        the model configuration.
-
         Args:
-            cfg: Model configuration specifying architecture hyperparameters.
-                Required fields: ``d_model``, ``n_heads``, ``n_kv_heads``,
-                ``d_head``, ``use_bias``, ``dropout_rate``.
-            rngs: Flax NNX RNG container used for parameter initialization
-                and dropout randomness.
-
-        Raises:
-            ValueError: If ``n_heads`` is not divisible by ``n_kv_heads``.
+            cfg: Model configuration.
+            rngs: Flax NNX RNG container.
         """
         self.n_heads = cfg.n_heads
         self.n_kv_heads = cfg.n_kv_heads
         self.d_head = cfg.d_head
         self.n_groups = cfg.n_heads // cfg.n_kv_heads
 
-        # Query projection: d_model -> n_heads * d_head
+        # nanochat extensions
+        self.use_qk_norm = cfg.use_qk_norm
+        self.attn_scale = cfg.qk_scale_factor / math.sqrt(cfg.d_head)
+        self.logit_softcap = cfg.logit_softcap
+        self.sliding_window_size = cfg.sliding_window_size
+        self.n_global_tokens = cfg.n_global_tokens
+
+        # Projections
         self.q_proj = nnx.Linear(
-            cfg.d_model,
-            cfg.n_heads * cfg.d_head,
-            use_bias=cfg.use_bias,
-            rngs=rngs,
+            cfg.d_model, cfg.n_heads * cfg.d_head,
+            use_bias=cfg.use_bias, rngs=rngs,
         )
-
-        # Key projection: d_model -> n_kv_heads * d_head
         self.k_proj = nnx.Linear(
-            cfg.d_model,
-            cfg.n_kv_heads * cfg.d_head,
-            use_bias=cfg.use_bias,
-            rngs=rngs,
+            cfg.d_model, cfg.n_kv_heads * cfg.d_head,
+            use_bias=cfg.use_bias, rngs=rngs,
         )
-
-        # Value projection: d_model -> n_kv_heads * d_head
         self.v_proj = nnx.Linear(
-            cfg.d_model,
-            cfg.n_kv_heads * cfg.d_head,
-            use_bias=cfg.use_bias,
-            rngs=rngs,
+            cfg.d_model, cfg.n_kv_heads * cfg.d_head,
+            use_bias=cfg.use_bias, rngs=rngs,
         )
-
-        # Output projection: n_heads * d_head -> d_model
         self.out_proj = nnx.Linear(
-            cfg.n_heads * cfg.d_head,
-            cfg.d_model,
-            use_bias=cfg.use_bias,
-            rngs=rngs,
+            cfg.n_heads * cfg.d_head, cfg.d_model,
+            use_bias=cfg.use_bias, rngs=rngs,
         )
 
-        # Attention dropout
         self.dropout = nnx.Dropout(cfg.dropout_rate, rngs=rngs)
 
         log.debug(
@@ -148,34 +168,25 @@ class GroupedQueryAttention(nnx.Module):
             n_heads=self.n_heads,
             n_kv_heads=self.n_kv_heads,
             d_head=self.d_head,
-            n_groups=self.n_groups,
-            d_model=cfg.d_model,
-            use_bias=cfg.use_bias,
-            dropout_rate=cfg.dropout_rate,
+            use_qk_norm=self.use_qk_norm,
+            attn_scale=self.attn_scale,
+            logit_softcap=self.logit_softcap,
+            sliding_window_size=self.sliding_window_size,
         )
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
     def _expand_kv(self, x: jax.Array) -> jax.Array:
-        """Expand key/value heads to match the number of query heads.
-
-        For standard MHA (``n_groups == 1``), this is a no-op. For GQA/MQA,
-        each KV head is repeated ``n_groups`` times so that every query head
-        has a corresponding key/value head for the attention computation.
-
-        Args:
-            x: Key or value tensor of shape
-                ``(batch, n_kv_heads, seq_len, d_head)``.
-
-        Returns:
-            Expanded tensor of shape ``(batch, n_heads, seq_len, d_head)``
-            where ``n_heads = n_kv_heads * n_groups``.
-        """
+        """Repeat KV heads to match query head count for GQA."""
         if self.n_groups == 1:
-            return x  # MHA: no expansion needed
-
-        # x: [B, n_kv_heads, S, d_head]
-        # Repeat each KV head n_groups times along the head dimension
-        # Result: [B, n_kv_heads * n_groups, S, d_head] = [B, n_heads, S, d_head]
+            return x
         return jnp.repeat(x, repeats=self.n_groups, axis=1)
+
+    # ------------------------------------------------------------------
+    # Forward pass
+    # ------------------------------------------------------------------
 
     def __call__(
         self,
@@ -186,164 +197,130 @@ class GroupedQueryAttention(nnx.Module):
         kv_cache: Optional[Tuple[jax.Array, jax.Array]] = None,
         deterministic: bool = True,
     ) -> Tuple[jax.Array, Tuple[jax.Array, jax.Array]]:
-        """Compute grouped-query attention with RoPE and optional KV cache.
+        """Compute attention with RoPE, optional QK norm, softcap, and window mask.
 
         Args:
-            x: Input tensor of shape ``(batch, seq_len, d_model)``.
-            cos: Cosine frequencies for RoPE of shape
-                ``(seq_len, d_head // 2)``. Obtained from
-                :meth:`RotaryEmbedding.get_freqs`.
-            sin: Sine frequencies for RoPE of shape
-                ``(seq_len, d_head // 2)``. Obtained from
-                :meth:`RotaryEmbedding.get_freqs`.
-            mask: Boolean attention mask of shape
-                ``(batch_or_1, 1, seq_len, seq_len_total)`` where ``True``
-                indicates positions that **can** be attended to and ``False``
-                indicates positions that should be masked out. For causal
-                decoding, ``seq_len_total = past_len + seq_len``.
-            kv_cache: Optional tuple ``(k_cache, v_cache)`` from previous
-                decoding steps. Each tensor has shape
-                ``(batch, n_kv_heads, past_len, d_head)``. When provided,
-                new keys and values are concatenated with the cache along
-                the sequence dimension.
-            deterministic: If ``True``, disables dropout (inference mode).
-                If ``False``, applies dropout (training mode).
+            x: Hidden states ``(batch, seq_len, d_model)``.
+            cos: RoPE cosines ``(seq_len, d_head // 2)``.
+            sin: RoPE sines ``(seq_len, d_head // 2)``.
+            mask: Boolean causal mask ``(1_or_B, 1, seq_len, seq_total)``,
+                True = attend. Pre-built by TransformerLM.
+            kv_cache: Optional ``(k_cache, v_cache)`` for incremental decoding.
+            deterministic: If True, disables attention dropout.
 
         Returns:
-            A tuple ``(output, new_kv_cache)`` where:
-            - ``output``: Attention output of shape
-              ``(batch, seq_len, d_model)``.
-            - ``new_kv_cache``: Updated KV cache tuple
-              ``(k, v)`` each of shape
-              ``(batch, n_kv_heads, total_seq_len, d_head)`` where
-              ``total_seq_len = past_len + seq_len``. These are the
-              **un-expanded** KV tensors (before GQA head replication).
-
-        Shape flow::
-
-            Input:  x [B, S, D]
-                        |
-                Q,K,V projections
-                        |
-            Q: [B, S, n_heads * d_head]   -> reshape -> [B, S, n_heads, d_head]    -> transpose -> [B, n_heads, S, d_head]
-            K: [B, S, n_kv_heads * d_head] -> reshape -> [B, S, n_kv_heads, d_head] -> transpose -> [B, n_kv_heads, S, d_head]
-            V: [B, S, n_kv_heads * d_head] -> reshape -> [B, S, n_kv_heads, d_head] -> transpose -> [B, n_kv_heads, S, d_head]
-                        |
-                Apply RoPE to Q, K
-                        |
-                Concatenate with KV cache (if present)
-                K: [B, n_kv_heads, S_total, d_head]
-                V: [B, n_kv_heads, S_total, d_head]
-                        |
-                Expand KV for GQA: repeat n_kv_heads -> n_heads
-                K_expanded: [B, n_heads, S_total, d_head]
-                V_expanded: [B, n_heads, S_total, d_head]
-                        |
-                Attention scores: Q @ K^T / sqrt(d_head)
-                scores: [B, n_heads, S, S_total]
-                        |
-                Apply mask + softmax + dropout
-                        |
-                Weighted sum: weights @ V
-                context: [B, n_heads, S, d_head]
-                        |
-                Transpose + reshape: [B, S, n_heads * d_head]
-                        |
-                Output projection: [B, S, D]
+            Tuple ``(output, new_kv_cache)`` where output has shape
+            ``(batch, seq_len, d_model)`` and new_kv_cache contains
+            updated key/value tensors for all attended positions.
         """
-        batch_size, seq_len, _ = x.shape
+        B, S, _ = x.shape
 
-        # -----------------------------------------------------------------
-        # Step 1: Project queries, keys, and values
-        # -----------------------------------------------------------------
+        # ----------------------------------------------------------------
+        # 1. Linear projections
+        # ----------------------------------------------------------------
         q = self.q_proj(x)  # [B, S, n_heads * d_head]
         k = self.k_proj(x)  # [B, S, n_kv_heads * d_head]
         v = self.v_proj(x)  # [B, S, n_kv_heads * d_head]
 
-        # -----------------------------------------------------------------
-        # Step 2: Reshape to multi-head format and transpose
-        # -----------------------------------------------------------------
-        q = q.reshape(batch_size, seq_len, self.n_heads, self.d_head)
-        q = jnp.transpose(q, (0, 2, 1, 3))  # [B, n_heads, S, d_head]
+        # ----------------------------------------------------------------
+        # 2. Reshape to multi-head format
+        # ----------------------------------------------------------------
+        q = q.reshape(B, S, self.n_heads, self.d_head)
+        q = jnp.transpose(q, (0, 2, 1, 3))          # [B, n_heads, S, d_head]
 
-        k = k.reshape(batch_size, seq_len, self.n_kv_heads, self.d_head)
-        k = jnp.transpose(k, (0, 2, 1, 3))  # [B, n_kv_heads, S, d_head]
+        k = k.reshape(B, S, self.n_kv_heads, self.d_head)
+        k = jnp.transpose(k, (0, 2, 1, 3))          # [B, n_kv_heads, S, d_head]
 
-        v = v.reshape(batch_size, seq_len, self.n_kv_heads, self.d_head)
-        v = jnp.transpose(v, (0, 2, 1, 3))  # [B, n_kv_heads, S, d_head]
+        v = v.reshape(B, S, self.n_kv_heads, self.d_head)
+        v = jnp.transpose(v, (0, 2, 1, 3))          # [B, n_kv_heads, S, d_head]
 
-        # -----------------------------------------------------------------
-        # Step 3: Apply Rotary Position Embeddings to Q and K
-        # -----------------------------------------------------------------
-        # cos, sin: [S, d_head // 2]
-        # RotaryEmbedding.apply expects [B, n_heads, S, d_head]
+        # ----------------------------------------------------------------
+        # 3. QK L2 normalization (nanochat feature)
+        #    Applied BEFORE RoPE so rotation operates on unit vectors.
+        # ----------------------------------------------------------------
+        if self.use_qk_norm:
+            q = _l2_normalize(q.astype(jnp.float32)).astype(q.dtype)
+            k = _l2_normalize(k.astype(jnp.float32)).astype(k.dtype)
+
+        # ----------------------------------------------------------------
+        # 4. Apply RoPE
+        # ----------------------------------------------------------------
         q = RotaryEmbedding.apply(q, cos, sin)  # [B, n_heads, S, d_head]
         k = RotaryEmbedding.apply(k, cos, sin)  # [B, n_kv_heads, S, d_head]
 
-        # -----------------------------------------------------------------
-        # Step 4: Concatenate with KV cache (for autoregressive decoding)
-        # -----------------------------------------------------------------
+        # ----------------------------------------------------------------
+        # 5. Concatenate KV cache (incremental decoding)
+        # ----------------------------------------------------------------
         if kv_cache is not None:
             k_cache, v_cache = kv_cache
-            # k_cache: [B, n_kv_heads, past_len, d_head]
-            # v_cache: [B, n_kv_heads, past_len, d_head]
-            k = jnp.concatenate(
-                [k_cache, k], axis=2
-            )  # [B, n_kv_heads, past_len + S, d_head]
-            v = jnp.concatenate(
-                [v_cache, v], axis=2
-            )  # [B, n_kv_heads, past_len + S, d_head]
+            k = jnp.concatenate([k_cache, k], axis=2)
+            v = jnp.concatenate([v_cache, v], axis=2)
 
-        # Save un-expanded KV for the cache return
-        new_kv_cache = (k, v)
+        new_kv_cache = (k, v)   # store pre-expansion KV
 
-        # -----------------------------------------------------------------
-        # Step 5: Expand KV heads for GQA
-        # -----------------------------------------------------------------
-        # Repeat each KV head n_groups times to match query head count
-        k_expanded = self._expand_kv(k)  # [B, n_heads, S_total, d_head]
-        v_expanded = self._expand_kv(v)  # [B, n_heads, S_total, d_head]
+        # ----------------------------------------------------------------
+        # 6. Expand KV heads for GQA
+        # ----------------------------------------------------------------
+        k_exp = self._expand_kv(k)  # [B, n_heads, S_total, d_head]
+        v_exp = self._expand_kv(v)  # [B, n_heads, S_total, d_head]
 
-        # -----------------------------------------------------------------
-        # Step 6: Compute scaled dot-product attention scores
-        # -----------------------------------------------------------------
-        scale = math.sqrt(self.d_head)
-        # Q @ K^T: [B, n_heads, S, d_head] @ [B, n_heads, d_head, S_total]
-        #        -> [B, n_heads, S, S_total]
-        scores = jnp.matmul(q, jnp.transpose(k_expanded, (0, 1, 3, 2))) / scale
+        # ----------------------------------------------------------------
+        # 7. Attention scores with nanochat scale
+        #    scale = qk_scale_factor / sqrt(d_head)  (not 1/sqrt(d_head))
+        # ----------------------------------------------------------------
+        # [B, n_heads, S, d_head] @ [B, n_heads, d_head, S_total]
+        scores = jnp.matmul(
+            q.astype(jnp.float32),
+            jnp.transpose(k_exp.astype(jnp.float32), (0, 1, 3, 2))
+        ) * self.attn_scale   # [B, n_heads, S, S_total]
 
-        # -----------------------------------------------------------------
-        # Step 7: Apply attention mask
-        # -----------------------------------------------------------------
-        # mask: [B_or_1, 1, S, S_total], True = attend, False = mask out
-        # Use a large negative value instead of -inf to avoid NaN in softmax
-        # when an entire row is masked (e.g., padding tokens).
-        scores = jnp.where(mask, scores, jnp.float32(-1e9))
+        # ----------------------------------------------------------------
+        # 8. Logit softcap (nanochat feature)
+        #    cap * tanh(logits / cap) — bounds logits to [-cap, cap]
+        #    Applied before masking so masked positions aren't used.
+        # ----------------------------------------------------------------
+        if self.logit_softcap is not None:
+            cap = float(self.logit_softcap)
+            scores = cap * jnp.tanh(scores / cap)
 
-        # -----------------------------------------------------------------
-        # Step 8: Softmax and dropout
-        # -----------------------------------------------------------------
+        # ----------------------------------------------------------------
+        # 9. Apply attention mask (causal ± sliding window)
+        #    mask: True = valid, False = masked out
+        # ----------------------------------------------------------------
+        # Apply sliding window on top of the pre-built causal mask if needed.
+        if self.sliding_window_size is not None:
+            S_total = k_exp.shape[2]
+            window_mask = _build_sliding_window_mask(
+                S_total, self.sliding_window_size, self.n_global_tokens
+            )  # [1, 1, S_total, S_total]
+            # Slice to [1, 1, S, S_total] to match the current query length
+            window_mask = window_mask[:, :, S_total - S:, :]
+            combined_mask = mask & window_mask
+        else:
+            combined_mask = mask
+
+        # Replace masked positions with large negative value (not -inf to
+        # avoid NaN when entire row is masked).
+        scores = jnp.where(combined_mask, scores, jnp.float32(-1e9))
+
+        # ----------------------------------------------------------------
+        # 10. Softmax + dropout
+        # ----------------------------------------------------------------
         weights = jax.nn.softmax(scores, axis=-1)  # [B, n_heads, S, S_total]
         weights = self.dropout(weights, deterministic=deterministic)
 
-        # -----------------------------------------------------------------
-        # Step 9: Compute weighted sum of values
-        # -----------------------------------------------------------------
-        # weights @ V: [B, n_heads, S, S_total] @ [B, n_heads, S_total, d_head]
-        #            -> [B, n_heads, S, d_head]
-        context = jnp.matmul(weights, v_expanded)  # [B, n_heads, S, d_head]
+        # ----------------------------------------------------------------
+        # 11. Weighted sum of values
+        # ----------------------------------------------------------------
+        context = jnp.matmul(weights, v_exp.astype(jnp.float32))  # [B, n_heads, S, d_head]
 
-        # -----------------------------------------------------------------
-        # Step 10: Reshape back to [B, S, d_model] and project
-        # -----------------------------------------------------------------
-        # Transpose: [B, n_heads, S, d_head] -> [B, S, n_heads, d_head]
-        context = jnp.transpose(context, (0, 2, 1, 3))
-        # Reshape: [B, S, n_heads, d_head] -> [B, S, n_heads * d_head]
-        context = context.reshape(batch_size, seq_len, self.n_heads * self.d_head)
+        # ----------------------------------------------------------------
+        # 12. Reshape + output projection
+        # ----------------------------------------------------------------
+        context = jnp.transpose(context, (0, 2, 1, 3))  # [B, S, n_heads, d_head]
+        context = context.reshape(B, S, self.n_heads * self.d_head).astype(x.dtype)
 
-        # Output projection: [B, S, n_heads * d_head] -> [B, S, d_model]
         output = self.out_proj(context)  # [B, S, d_model]
-
         return output, new_kv_cache
 
     def __repr__(self) -> str:
@@ -354,9 +331,8 @@ class GroupedQueryAttention(nnx.Module):
             variant = "MQA"
         return (
             f"GroupedQueryAttention("
-            f"variant={variant}, "
-            f"n_heads={self.n_heads}, "
-            f"n_kv_heads={self.n_kv_heads}, "
-            f"d_head={self.d_head}, "
-            f"n_groups={self.n_groups})"
+            f"variant={variant}, n_heads={self.n_heads}, "
+            f"n_kv_heads={self.n_kv_heads}, d_head={self.d_head}, "
+            f"qk_norm={self.use_qk_norm}, softcap={self.logit_softcap}, "
+            f"window={self.sliding_window_size})"
         )
