@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  trainer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ../outputs:/app/outputs
+      - ../checkpoints:/app/checkpoints
+    environment:
+      - JAX_PLATFORMS=cpu
+      - PYTHONPATH=/app/src
+    command: ["scripts/train.py", "--model-size", "nano", "--total-steps", "200"]
+
+  tensorboard:
+    image: tensorflow/tensorflow:latest
+    ports:
+      - "6006:6006"
+    volumes:
+      - ../outputs:/logs
+    command: ["tensorboard", "--logdir=/logs", "--bind_all"]

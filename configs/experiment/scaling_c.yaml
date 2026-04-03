@@ -1,0 +1,11 @@
+type: scale_c
+description: "Vary compute (C = 6ND) along Chinchilla frontier"
+compute_budgets_flops:
+  - 1.0e+17
+  - 3.0e+17
+  - 1.0e+18
+  - 3.0e+18
+  - 1.0e+19
+chinchilla_ratio: 20.0
+seeds: [42]
+output_dir: outputs/scaling/scale_c

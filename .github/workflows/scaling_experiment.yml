@@ -1,0 +1,31 @@
+name: Scaling Experiments
+
+on:
+  workflow_dispatch:
+    inputs:
+      experiment:
+        description: 'Experiment type'
+        required: true
+        default: 'scale_n'
+        type: choice
+        options:
+          - scale_n
+          - scale_d
+
+jobs:
+  run-scaling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Run scaling experiment
+        run: python scripts/run_scaling.py --experiment ${{ github.event.inputs.experiment }} --max-steps 50
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: scaling-results
+          path: outputs/scaling/

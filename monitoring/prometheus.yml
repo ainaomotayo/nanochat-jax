@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'nanochat-trainer'
+    static_configs:
+      - targets: ['trainer:8080']
+    metrics_path: '/metrics'

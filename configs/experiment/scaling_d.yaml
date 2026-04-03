@@ -1,0 +1,10 @@
+type: scale_d
+description: "Vary token budget (D) at fixed model size"
+model_config: small
+token_budgets:
+  - 100000000
+  - 300000000
+  - 1000000000
+  - 3000000000
+seeds: [42, 43, 44]
+output_dir: outputs/scaling/scale_d

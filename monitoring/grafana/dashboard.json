@@ -1,0 +1,28 @@
+{
+  "dashboard": {
+    "title": "NanoChat-JAX Training",
+    "panels": [
+      {
+        "title": "Training Loss",
+        "type": "timeseries",
+        "targets": [
+          {"expr": "nanochat_train_loss"}
+        ]
+      },
+      {
+        "title": "Tokens/sec",
+        "type": "stat",
+        "targets": [
+          {"expr": "nanochat_tokens_per_second"}
+        ]
+      },
+      {
+        "title": "Learning Rate",
+        "type": "timeseries",
+        "targets": [
+          {"expr": "nanochat_learning_rate"}
+        ]
+      }
+    ]
+  }
+}

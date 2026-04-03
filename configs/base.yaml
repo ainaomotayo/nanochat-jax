@@ -1,0 +1,27 @@
+defaults:
+  - model: small
+  - training: default
+  - data: openwebtext
+  - _self_
+
+project:
+  name: nanochat-jax
+  run_id: ${now:%Y%m%d_%H%M%S}
+  output_dir: outputs/${project.name}/${project.run_id}
+  seed: 42
+
+logging:
+  level: INFO
+  format: json
+  wandb:
+    enabled: false
+    project: nanochat-jax
+    entity: null
+  tensorboard:
+    enabled: true
+    log_dir: ${project.output_dir}/tensorboard
+
+hardware:
+  n_devices: null
+  dtype: bfloat16
+  mesh_shape: null

@@ -1,0 +1,10 @@
+type: scale_n
+description: "Vary model size (N params) at fixed compute budget"
+model_configs:
+  - nano
+  - small
+  - medium
+  - large
+fixed_token_budget: 1000000000
+seeds: [42, 43, 44]
+output_dir: outputs/scaling/scale_n
