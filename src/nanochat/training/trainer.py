@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import signal
 import time
+from pathlib import Path
 from typing import Any, Iterator
 
 import jax
@@ -59,6 +60,18 @@ class Trainer:
             keep_last_n=train_cfg.keep_last_n,
         )
 
+        # Resume from checkpoint if requested
+        if train_cfg.resume_from:
+            resume_path = Path(train_cfg.resume_from)
+            if resume_path.exists():
+                self.global_step = self.ckpt_manager.load(
+                    resume_path, model, optimizer=self.optimizer
+                )
+                logger.info("resumed_from_checkpoint",
+                            step=self.global_step, path=str(resume_path))
+            else:
+                logger.warning("resume_path_not_found", path=str(resume_path))
+
         # Compute dtype
         self.compute_dtype = DTYPE_MAP.get(train_cfg.dtype, jnp.bfloat16)
 
@@ -100,13 +113,15 @@ class Trainer:
                 batch["input_ids"],
                 deterministic=False,
             )
-            # Causal LM: logit[t] predicts token[t+1]
-            # logits[:, :-1, :] → predictions at positions 0..S-2
-            # labels[:, 1:]    → targets at positions 1..S-1
+            # Data contract: batch["labels"][t] = target for logit[t] (pre-shifted).
+            # TokenDataset:   labels = window[1:]  (shifted by 1 at load time)
+            # PackedBatch:    labels[t] = next token or IGNORE_INDEX
+            # Synthetic:      labels = ids_full[:, 1:] (see train.py)
+            # So: logits[:, :-1, :] paired with labels[:, :-1] is correct.
             labels_src = batch["labels"] if "labels" in batch else batch["input_ids"]
             loss, metrics = cross_entropy_loss(
                 logits=logits[:, :-1, :],
-                labels=labels_src[:, 1:],
+                labels=labels_src[:, :-1],
             )
             return loss, metrics
 
@@ -144,7 +159,7 @@ class Trainer:
             labels_src = batch.get("labels", batch["input_ids"])
             loss, metrics = cross_entropy_loss(
                 logits=logits[:, :-1, :],
-                labels=labels_src[:, 1:],
+                labels=labels_src[:, :-1],
             )
             total_loss += float(loss) * float(metrics["n_tokens"])
             total_tokens += float(metrics["n_tokens"])
@@ -174,7 +189,8 @@ class Trainer:
         for step in range(self.global_step, self.train_cfg.total_steps):
             if self._interrupted:
                 logger.info("training_interrupted", step=step)
-                self.ckpt_manager.save(step, self.model, {"interrupted": True})
+                self.ckpt_manager.save(step, self.model, {"interrupted": True},
+                                       optimizer=self.optimizer)
                 break
 
             self.global_step = step
@@ -212,7 +228,8 @@ class Trainer:
 
             # Save checkpoint
             if step > 0 and step % self.train_cfg.save_every_steps == 0:
-                self.ckpt_manager.save(step, self.model, metrics)
+                self.ckpt_manager.save(step, self.model, metrics,
+                                       optimizer=self.optimizer)
 
         # Final save
         total_time = time.time() - start_time
@@ -222,7 +239,8 @@ class Trainer:
             "total_time_seconds": total_time,
             "total_params": self.param_counts.get("total", 0),
         }
-        self.ckpt_manager.save(self.global_step, self.model, final_metrics)
+        self.ckpt_manager.save(self.global_step, self.model, final_metrics,
+                               optimizer=self.optimizer)
 
         logger.info("training_complete", **final_metrics)
         return final_metrics

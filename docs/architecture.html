@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>nanochat-jax — Architecture</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0d1117;
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      color: #e6edf3;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 32px 16px 64px;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 36px;
+    }
+    header h1 {
+      font-size: 22px;
+      font-weight: 600;
+      letter-spacing: .5px;
+      color: #58a6ff;
+    }
+    header p {
+      font-size: 12px;
+      color: #8b949e;
+      margin-top: 6px;
+      font-family: system-ui, sans-serif;
+    }
+
+    #diagram-wrap {
+      width: 100%;
+      max-width: 1080px;
+      overflow-x: auto;
+    }
+
+    svg { display: block; margin: auto; }
+
+    /* ── node groups ─────────────────────────────────────── */
+    .node-group rect {
+      rx: 8;
+      ry: 8;
+      stroke-width: 1.5;
+    }
+    .node-group text {
+      dominant-baseline: central;
+      text-anchor: middle;
+      pointer-events: none;
+    }
+    .node-group .title { font-size: 12px; font-weight: 700; }
+    .node-group .sub   { font-size: 10px; fill: #8b949e; }
+
+    /* node colour palette */
+    .c-io        { fill: #161b22; stroke: #30363d; }
+    .c-embed     { fill: #0d2137; stroke: #1f6feb; }
+    .c-special   { fill: #1a1a2e; stroke: #6e40c9; }
+    .c-norm      { fill: #0f1f0f; stroke: #2ea043; }
+    .c-attn      { fill: #1f1b00; stroke: #d29922; }
+    .c-ffn       { fill: #1a0f1f; stroke: #bc8cff; }
+    .c-scalar    { fill: #16161a; stroke: #656d76; }
+    .c-loss      { fill: #1f0d0d; stroke: #f85149; }
+    .c-block     { fill: none;    stroke: #30363d; stroke-dasharray: 6 3; rx: 12; ry: 12; }
+
+    /* ── edges ───────────────────────────────────────────── */
+    .edge {
+      fill: none;
+      stroke: #30363d;
+      stroke-width: 1.5;
+      marker-end: url(#arrow);
+    }
+    .edge-special {
+      stroke: #6e40c9;
+      stroke-dasharray: 5 3;
+      opacity: .7;
+    }
+    .edge-residual {
+      stroke: #2ea043;
+      stroke-dasharray: 4 2;
+      opacity: .6;
+    }
+
+    /* ── legend ──────────────────────────────────────────── */
+    .legend rect { rx: 4; ry: 4; }
+    .legend text { font-size: 11px; font-family: system-ui, sans-serif; fill: #8b949e; dominant-baseline: central; }
+
+    /* ── tooltip ─────────────────────────────────────────── */
+    #tooltip {
+      position: fixed;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 12px;
+      line-height: 1.6;
+      color: #e6edf3;
+      pointer-events: none;
+      max-width: 280px;
+      display: none;
+      z-index: 99;
+      font-family: system-ui, sans-serif;
+    }
+    #tooltip strong { color: #58a6ff; display: block; margin-bottom: 4px; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>nanochat-jax — Model Architecture</h1>
+  <p>Hover any component for details · AI GDE TPU Sprint 2026 · Powered by JAX + Flax NNX</p>
+</header>
+
+<div id="diagram-wrap"></div>
+<div id="tooltip"></div>
+
+<script>
+// ─── layout constants ────────────────────────────────────────────────
+const W = 1040, H = 920;
+const CX = W / 2;          // horizontal centre
+const NW = 200, NH = 46;   // default node width / height
+const GAP = 16;             // vertical gap between nodes
+
+// ─── tooltips ───────────────────────────────────────────────────────
+const tips = {
+  "Input Tokens":         { title:"Input Tokens [B, S]",        body:"Integer token IDs, shape (batch, seq_len). B = batch size, S = sequence length up to max_seq_len." },
+  "Token Embedding":      { title:"Token Embedding",             body:"Lookup table: vocab_size → d_model. init_std = 0.02. Shared weight optionally tied to LM Head (nanochat default: untied)." },
+  "Value Embedding":      { title:"Value Embedding (nanochat)",  body:"Per-token learned residual bias added to every block's input. Shared table across all layers. init_scale = 1e-4. Unique to nanochat." },
+  "Smear":                { title:"Smear — Token Mixing",        body:"Causal 1-D token mixing before attention. Learnable sigmoid gates (raw_alpha init −10 ≈ near-identity). Unique to nanochat." },
+  "RMSNorm (pre-attn)":   { title:"Parameterless RMSNorm",       body:"y = x / √(mean(x²) + ε). NO learned gamma/beta. ε = 1e-6. nanochat's key departure from standard LLaMA RMSNorm." },
+  "GQA + RoPE":           { title:"Grouped-Query Attention",     body:"Q: n_heads projections. K/V: n_kv_heads projections (n_kv_heads ≤ n_heads). RoPE base=100,000. QK L2-normalised then scaled by 1.2/√d_head. Logit softcap: 30·tanh(logits/30)." },
+  "QK Norm":              { title:"QK L2 Norm",                  body:"Q and K are L2-normalised before dot-product. Scale factor = 1.2/√d_head. Prevents attention score blow-up without softmax temperature tuning." },
+  "Logit Softcap":        { title:"Logit Softcap (cap=30)",      body:"attention_logits = 30·tanh(raw_logits/30). Bounds attention logits, improving training stability. Introduced in Gemma 2." },
+  "KV Cache":             { title:"KV Cache",                    body:"Pre-allocated [B, n_kv_heads, max_seq_len, d_head] buffers updated via jax.lax.dynamic_update_slice. Zero-copy decode step." },
+  "α_attn":               { title:"Per-layer α_attn scalar",     body:"Learnable scalar multiplier on the attention output before residual. Initialised to 1.0. Gives the model fine-grained control over residual contribution per layer." },
+  "Backout":              { title:"Backout — Token Mixing",       body:"Causal token mixing after attention, before FFN. Complementary to Smear. Sigmoid gate (raw_beta init −10). Unique to nanochat." },
+  "RMSNorm (pre-ffn)":    { title:"Parameterless RMSNorm",       body:"Same parameterless RMSNorm as pre-attention. No extra parameters." },
+  "relu² MLP":            { title:"relu² Feed-Forward",          body:"h = x · relu(x)  (relu-squared activation, also called ReGLU without gate). 2 projections: up [d_model→d_ff] and down [d_ff→d_model]. d_ff = 4·d_model. No bias." },
+  "α_ffn":                { title:"Per-layer α_ffn scalar",      body:"Learnable scalar on FFN output before residual. Initialised to 1.0. Same purpose as α_attn." },
+  "From-Depth Init":      { title:"From-Depth Initialisation",   body:"out_proj and down_proj weights scaled by 1/√(2·(layer_idx+1)). Ensures variance doesn't grow with depth at initialisation." },
+  "Final RMSNorm":        { title:"Final RMSNorm",               body:"Post-transformer parameterless RMSNorm before LM head projection." },
+  "LM Head":              { title:"LM Head (Untied)",            body:"Linear [d_model → vocab_size]. nanochat uses untied embeddings (tie_embeddings=False). Separate set of parameters from Token Embedding." },
+  "Softcap + Loss":       { title:"Output Softcap + CE Loss",    body:"Optional logit softcap on final logits. Cross-entropy loss with optional label smoothing and z-loss (PaLM-style). IGNORE_INDEX = -100." },
+};
+
+// ─── colour helper ───────────────────────────────────────────────────
+function cc(cls) { return cls; }
+
+// ─── node definitions ────────────────────────────────────────────────
+//   { id, label, sub, cls, x, y, w, h }
+//   x,y = top-left corner of the rect; we'll compute centres for edges
+
+function node(id, label, sub, cls, y, xOffset=0, w=NW, h=NH) {
+  return { id, label, sub, cls, x: CX - w/2 + xOffset, y, w, h };
+}
+
+const nodes = [
+  // ── inputs ──────────────────────────────────────────────────────────
+  node("Input Tokens",       "Input Tokens",        "[B, S]  int32",             "c-io",      20,         0, 200, 42),
+  // ── embeddings ──────────────────────────────────────────────────────
+  node("Token Embedding",    "Token Embedding",     "vocab → d_model  |  no tie","c-embed",  84,  -108, 196, 44),
+  node("Value Embedding",    "Value Embedding ✦",   "shared residual  init=1e-4","c-special",  84,   108, 196, 44),
+  // ── smear ───────────────────────────────────────────────────────────
+  node("Smear",              "Smear ✦",             "causal token mix  σ(−10)",  "c-special", 160,        0, 200, 44),
+
+  // ── block outline (just a bg rect — drawn separately) ───────────────
+
+  // ── pre-attn norm ───────────────────────────────────────────────────
+  node("RMSNorm (pre-attn)", "RMSNorm",             "parameterless  ε=1e-6",     "c-norm",   260,        0, 200, 40),
+  // ── attention row: qk-norm | attn | kvcache ─────────────────────────
+  node("QK Norm",            "QK L2 Norm ✦",        "scale 1.2/√d_head",         "c-attn",   330,  -220, 156, 40),
+  node("GQA + RoPE",         "GQA + RoPE ✦",        "base=100k  softcap=30",     "c-attn",   330,     0, 200, 40),
+  node("Logit Softcap",      "Logit Softcap ✦",     "30·tanh(x/30)",             "c-attn",   330,   220, 156, 40),
+  node("KV Cache",           "KV Cache",            "jax.lax.dynamic_update",    "c-io",     330,   400, 160, 40),
+
+  // ── alpha attn ──────────────────────────────────────────────────────
+  node("α_attn",             "α_attn ✦",            "per-layer scalar  init=1",  "c-scalar", 400,  -320,  140, 36),
+
+  // ── backout ─────────────────────────────────────────────────────────
+  node("Backout",            "Backout ✦",           "post-attn mix  σ(−10)",     "c-special", 460,        0, 200, 40),
+
+  // ── pre-ffn norm ────────────────────────────────────────────────────
+  node("RMSNorm (pre-ffn)",  "RMSNorm",             "parameterless  ε=1e-6",     "c-norm",   524,        0, 200, 40),
+  // ── ffn ─────────────────────────────────────────────────────────────
+  node("relu² MLP",          "relu² MLP ✦",         "h = x·relu(x)  d_ff=4d",   "c-ffn",    590,        0, 200, 44),
+  // ── alpha ffn ───────────────────────────────────────────────────────
+  node("α_ffn",              "α_ffn ✦",             "per-layer scalar  init=1",  "c-scalar", 590,   260,  140, 44),
+  // ── from-depth ──────────────────────────────────────────────────────
+  node("From-Depth Init",    "From-Depth Init ✦",   "1/√(2·(L+1))",             "c-scalar", 652,        0, 200, 36),
+
+  // ── post-block ──────────────────────────────────────────────────────
+  node("Final RMSNorm",      "Final RMSNorm",       "parameterless",             "c-norm",   730,        0, 200, 40),
+  node("LM Head",            "LM Head",             "d_model → vocab  untied",   "c-embed",  796,        0, 200, 40),
+  node("Softcap + Loss",     "Softcap + CE Loss",   "z-loss · label-smooth",     "c-loss",   860,        0, 200, 42),
+];
+
+// ─── edge definitions ────────────────────────────────────────────────
+// { from, to, type }  type: '' | 'special' | 'residual'
+const edges = [
+  { from:"Input Tokens",      to:"Token Embedding",    type:"" },
+  { from:"Input Tokens",      to:"Value Embedding",    type:"special" },
+  { from:"Token Embedding",   to:"Smear",              type:"" },
+  { from:"Value Embedding",   to:"Smear",              type:"special" },
+  { from:"Smear",             to:"RMSNorm (pre-attn)", type:"" },
+  { from:"RMSNorm (pre-attn)",to:"QK Norm",            type:"special" },
+  { from:"RMSNorm (pre-attn)",to:"GQA + RoPE",         type:"" },
+  { from:"QK Norm",           to:"GQA + RoPE",         type:"special" },
+  { from:"GQA + RoPE",        to:"Logit Softcap",      type:"special" },
+  { from:"Logit Softcap",     to:"Backout",            type:"" },
+  { from:"KV Cache",          to:"GQA + RoPE",         type:"special" },
+  { from:"α_attn",            to:"Backout",            type:"residual" },
+  { from:"Backout",           to:"RMSNorm (pre-ffn)",  type:"" },
+  { from:"RMSNorm (pre-ffn)", to:"relu² MLP",          type:"" },
+  { from:"relu² MLP",         to:"From-Depth Init",    type:"" },
+  { from:"α_ffn",             to:"From-Depth Init",    type:"residual" },
+  { from:"From-Depth Init",   to:"Final RMSNorm",      type:"" },
+  { from:"Final RMSNorm",     to:"LM Head",            type:"" },
+  { from:"LM Head",           to:"Softcap + Loss",     type:"" },
+];
+
+// ─── build lookup ────────────────────────────────────────────────────
+const byId = {};
+nodes.forEach(n => { byId[n.id] = n; });
+
+function cx(n) { return n.x + n.w / 2; }
+function cy(n) { return n.y + n.h / 2; }
+
+// ─── SVG setup ───────────────────────────────────────────────────────
+const svg = d3.select("#diagram-wrap").append("svg")
+  .attr("width",  W)
+  .attr("height", H)
+  .attr("viewBox", `0 0 ${W} ${H}`)
+  .style("background", "#0d1117");
+
+// ── defs: arrow marker ───────────────────────────────────────────────
+const defs = svg.append("defs");
+["arrow","arrow-special","arrow-residual"].forEach((id, i) => {
+  const colors = ["#30363d","#6e40c9","#2ea043"];
+  defs.append("marker")
+    .attr("id", id).attr("markerWidth",8).attr("markerHeight",6)
+    .attr("refX",7).attr("refY",3).attr("orient","auto")
+    .append("polygon")
+    .attr("points","0 0, 8 3, 0 6")
+    .attr("fill", colors[i]);
+});
+
+// ── block background ─────────────────────────────────────────────────
+const blockY1 = 240, blockY2 = 700;
+svg.append("rect")
+  .attr("x", 60).attr("y", blockY1)
+  .attr("width", W - 120).attr("height", blockY2 - blockY1)
+  .attr("class", "c-block")
+  .attr("fill","none")
+  .attr("stroke","#30363d")
+  .attr("stroke-dasharray","8 4")
+  .attr("rx",12);
+
+svg.append("text")
+  .attr("x", 76).attr("y", blockY1 + 18)
+  .attr("fill","#30363d").attr("font-size","11px")
+  .attr("font-family","system-ui,sans-serif")
+  .text("TransformerBlock × L  (repeated L times)");
+
+// ── edges ────────────────────────────────────────────────────────────
+function edgePath(e) {
+  const s = byId[e.from], t = byId[e.to];
+  if (!s || !t) return;
+
+  const sx = cx(s), sy = s.y + s.h;
+  const tx = cx(t), ty = t.y;
+  const my = (sy + ty) / 2;
+
+  const cls   = "edge" + (e.type === "special" ? " edge-special" : e.type === "residual" ? " edge-residual" : "");
+  const marker= e.type === "special" ? "url(#arrow-special)" : e.type === "residual" ? "url(#arrow-residual)" : "url(#arrow)";
+
+  // straight or curved
+  let d;
+  if (Math.abs(sx - tx) < 4) {
+    d = `M${sx},${sy} L${tx},${ty}`;
+  } else {
+    d = `M${sx},${sy} C${sx},${my} ${tx},${my} ${tx},${ty}`;
+  }
+  svg.append("path").attr("class", cls).attr("d", d).attr("marker-end", marker);
+}
+edges.forEach(edgePath);
+
+// ── nodes ────────────────────────────────────────────────────────────
+const tooltip = d3.select("#tooltip");
+
+nodes.forEach(n => {
+  const g = svg.append("g").attr("class","node-group").style("cursor","default");
+
+  g.append("rect")
+    .attr("x", n.x).attr("y", n.y)
+    .attr("width", n.w).attr("height", n.h)
+    .attr("class", n.cls)
+    .attr("rx", 8).attr("ry", 8)
+    .attr("stroke-width", 1.5);
+
+  g.append("text")
+    .attr("class","title")
+    .attr("x", cx(n)).attr("y", n.sub ? cy(n) - 8 : cy(n))
+    .attr("fill","#e6edf3")
+    .text(n.label);
+
+  if (n.sub) {
+    g.append("text")
+      .attr("class","sub")
+      .attr("x", cx(n)).attr("y", cy(n) + 9)
+      .text(n.sub);
+  }
+
+  // hover
+  const tip = tips[n.id];
+  if (tip) {
+    g.on("mousemove", (event) => {
+      tooltip.style("display","block")
+        .style("left", (event.clientX + 14) + "px")
+        .style("top",  (event.clientY - 10) + "px")
+        .html(`<strong>${tip.title}</strong>${tip.body}`);
+    }).on("mouseleave", () => tooltip.style("display","none"));
+
+    // glow on hover
+    g.on("mouseenter", function() {
+      d3.select(this).select("rect").attr("filter","url(#glow)");
+    }).on("mouseleave", function() {
+      d3.select(this).select("rect").attr("filter",null);
+      tooltip.style("display","none");
+    });
+  }
+});
+
+// glow filter
+const filter = defs.append("filter").attr("id","glow");
+filter.append("feGaussianBlur").attr("stdDeviation","3").attr("result","coloredBlur");
+const feMerge = filter.append("feMerge");
+feMerge.append("feMergeNode").attr("in","coloredBlur");
+feMerge.append("feMergeNode").attr("in","SourceGraphic");
+
+// ── "×L" repeat label ────────────────────────────────────────────────
+svg.append("text")
+  .attr("x", W - 72).attr("y", (blockY1 + blockY2) / 2)
+  .attr("fill","#30363d").attr("font-size","28px").attr("font-weight","700")
+  .attr("text-anchor","middle").attr("writing-mode","tb")
+  .style("letter-spacing","4px")
+  .text("× L");
+
+// ── Legend ───────────────────────────────────────────────────────────
+const legendItems = [
+  { label:"I/O",             cls:"c-io",      stroke:"#30363d" },
+  { label:"Embedding",       cls:"c-embed",   stroke:"#1f6feb" },
+  { label:"✦ nanochat only", cls:"c-special", stroke:"#6e40c9" },
+  { label:"Norm",            cls:"c-norm",    stroke:"#2ea043" },
+  { label:"Attention",       cls:"c-attn",    stroke:"#d29922" },
+  { label:"FFN",             cls:"c-ffn",     stroke:"#bc8cff" },
+  { label:"Loss",            cls:"c-loss",    stroke:"#f85149" },
+];
+const leg = svg.append("g").attr("class","legend").attr("transform",`translate(${W - 190}, ${H - 180})`);
+leg.append("rect").attr("x",-8).attr("y",-8).attr("width",182).attr("height",legendItems.length*22+12).attr("fill","#161b22").attr("stroke","#30363d").attr("rx",6);
+legendItems.forEach((it, i) => {
+  leg.append("rect").attr("x",0).attr("y",i*22).attr("width",14).attr("height",14)
+    .attr("fill","#161b22").attr("stroke",it.stroke).attr("stroke-width",1.5).attr("rx",3);
+  leg.append("text").attr("x",22).attr("y",i*22+7).text(it.label);
+});
+
+// ── residual bypass arrow (left side) ────────────────────────────────
+function residualBypass(y1, y2, x=56, label="residual") {
+  const path = `M${x},${y1} C${x-24},${y1} ${x-24},${y2} ${x},${y2}`;
+  svg.append("path").attr("d",path).attr("class","edge edge-residual").attr("marker-end","url(#arrow-residual)");
+  svg.append("text").attr("x",x-30).attr("y",(y1+y2)/2).attr("fill","#2ea043")
+    .attr("font-size","9px").attr("text-anchor","middle").attr("transform",`rotate(-90,${x-30},${(y1+y2)/2})`).text(label);
+}
+residualBypass(306, 460, 56, "+residual");
+residualBypass(570, 698, 56, "+residual");
+
+// ── credits ──────────────────────────────────────────────────────────
+svg.append("text")
+  .attr("x", W/2).attr("y", H - 10)
+  .attr("fill","#30363d").attr("font-size","10px")
+  .attr("text-anchor","middle")
+  .attr("font-family","system-ui,sans-serif")
+  .text("nanochat-jax · AI GDE TPU Sprint 2026 · Supported by Google TPU Research Cloud");
+</script>
+</body>
+</html>

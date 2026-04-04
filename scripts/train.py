@@ -46,7 +46,7 @@ def main() -> None:
     parser.add_argument("--save-every", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16"])
-    parser.add_argument("--use-synthetic", action="store_true", default=True,
+    parser.add_argument("--use-synthetic", action="store_true", default=False,
                        help="Use synthetic data (for testing)")
     parser.add_argument("--data-path", type=str, default=None, help="Path to HDF5 token dataset")
     args = parser.parse_args()
@@ -78,17 +78,19 @@ def main() -> None:
 
     # Build data loaders
     if args.use_synthetic or args.data_path is None:
-        # Synthetic data loader for testing
+        # Synthetic data loader — generate S+1 tokens so labels can be shifted by 1.
+        # labels[t] = token[t+1], matching TokenDataset's pre-shifted convention.
         def synthetic_loader():
             rng = jax.random.PRNGKey(args.seed + 100)
+            S = model_cfg.max_seq_len
             while True:
                 rng, batch_rng = jax.random.split(rng)
-                ids = jax.random.randint(batch_rng, (train_cfg.batch_size, model_cfg.max_seq_len),
+                ids = jax.random.randint(batch_rng, (train_cfg.batch_size, S + 1),
                                          0, model_cfg.vocab_size)
                 yield {
-                    "input_ids": ids,
-                    "labels": ids,
-                    "attention_mask": jnp.ones_like(ids),
+                    "input_ids": ids[:, :-1],          # [B, S]
+                    "labels":    ids[:, 1:],            # [B, S] pre-shifted
+                    "attention_mask": jnp.ones((train_cfg.batch_size, S), jnp.int32),
                 }
         train_loader = synthetic_loader()
         val_loader = synthetic_loader()
