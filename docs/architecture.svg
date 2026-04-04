@@ -1,0 +1,201 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 940" width="1040" height="940">
+  <defs>
+    <!-- Arrow markers -->
+    <marker id="arr" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#30363d"/>
+    </marker>
+    <marker id="arr-s" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#6e40c9"/>
+    </marker>
+    <marker id="arr-r" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#2ea043"/>
+    </marker>
+    <style>
+      .t { font-family: 'SF Mono','Fira Code','Cascadia Code',monospace; font-size: 12px; font-weight: 700; fill: #e6edf3; text-anchor: middle; dominant-baseline: central; }
+      .s { font-family: 'SF Mono','Fira Code','Cascadia Code',monospace; font-size: 10px; fill: #8b949e; text-anchor: middle; dominant-baseline: central; }
+      .ui { font-family: system-ui,sans-serif; }
+    </style>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1040" height="940" fill="#0d1117"/>
+
+  <!-- Title -->
+  <text class="ui" x="520" y="14" text-anchor="middle" font-size="14" font-weight="600" fill="#58a6ff">nanochat-jax — Architecture</text>
+  <text class="ui" x="520" y="28" text-anchor="middle" font-size="10" fill="#8b949e">✦ marks nanochat-specific components absent from standard GPT/LLaMA</text>
+
+  <!-- ═══════════════ TRANSFORMER BLOCK OUTLINE ═══════════════ -->
+  <rect x="60" y="245" width="920" height="455" rx="12" fill="none" stroke="#30363d" stroke-dasharray="8 4" stroke-width="1.5"/>
+  <text class="ui" x="76" y="263" font-size="11" fill="#30363d">TransformerBlock × L  (repeated L times)</text>
+  <!-- ×L vertical label -->
+  <text class="ui" x="968" y="394" text-anchor="middle" font-size="22" font-weight="700" fill="#30363d" transform="rotate(90 968 472)">× L</text>
+
+  <!-- ═══════════════ RESIDUAL BYPASS ARROWS (left side) ═══════════════ -->
+  <!-- Attention residual: from bottom of RMSNorm(pre-attn) to Backout -->
+  <path d="M56,305 C32,305 32,460 56,460" fill="none" stroke="#2ea043" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arr-r)" opacity="0.7"/>
+  <text class="ui" x="20" y="382" font-size="9" fill="#2ea043" text-anchor="middle" transform="rotate(-90 20 382)">+residual</text>
+  <!-- FFN residual: from bottom of RMSNorm(pre-ffn) to From-Depth Init -->
+  <path d="M56,570 C32,570 32,698 56,698" fill="none" stroke="#2ea043" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arr-r)" opacity="0.7"/>
+  <text class="ui" x="20" y="634" font-size="9" fill="#2ea043" text-anchor="middle" transform="rotate(-90 20 634)">+residual</text>
+
+  <!-- ═══════════════ EDGES ═══════════════ -->
+  <!-- 1. Input Tokens → Token Embedding [normal] -->
+  <path d="M520,72 C520,83 412,83 412,94" fill="none" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- 2. Input Tokens → Value Embedding [special] -->
+  <path d="M520,72 C520,83 628,83 628,94" fill="none" stroke="#6e40c9" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-s)" opacity="0.8"/>
+  <!-- 3. Token Embedding → Smear [normal] -->
+  <path d="M412,138 C412,154 520,154 520,170" fill="none" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- 4. Value Embedding → Smear [special] -->
+  <path d="M628,138 C628,154 520,154 520,170" fill="none" stroke="#6e40c9" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-s)" opacity="0.8"/>
+  <!-- 5. Smear → RMSNorm(pre-attn) [normal] -->
+  <line x1="520" y1="214" x2="520" y2="265" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- 6. RMSNorm(pre-attn) → QK Norm [special] -->
+  <path d="M520,305 C520,320 300,320 300,335" fill="none" stroke="#6e40c9" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-s)" opacity="0.8"/>
+  <!-- 7. RMSNorm(pre-attn) → GQA + RoPE [normal] -->
+  <line x1="520" y1="305" x2="520" y2="335" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- 8. QK Norm → GQA (horizontal) [special] -->
+  <line x1="378" y1="355" x2="419" y2="355" stroke="#6e40c9" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-s)" opacity="0.8"/>
+  <!-- 9. GQA → Logit Softcap (horizontal) [special] -->
+  <line x1="620" y1="355" x2="661" y2="355" stroke="#6e40c9" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-s)" opacity="0.8"/>
+  <!-- 10. KV Cache → GQA (horizontal, going left) [special] -->
+  <line x1="840" y1="355" x2="621" y2="355" stroke="#6e40c9" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-s)" opacity="0.8"/>
+  <!-- 11. Logit Softcap → Backout [normal] -->
+  <path d="M740,375 C740,420 520,420 520,465" fill="none" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- 12. α_attn → Backout [residual] -->
+  <path d="M200,441 C200,453 520,453 520,465" fill="none" stroke="#2ea043" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arr-r)" opacity="0.7"/>
+  <!-- 13. Backout → RMSNorm(pre-ffn) [normal] -->
+  <line x1="520" y1="505" x2="520" y2="530" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- 14. RMSNorm(pre-ffn) → relu² MLP [normal] -->
+  <line x1="520" y1="570" x2="520" y2="595" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- 15. relu² MLP → From-Depth Init [normal] -->
+  <line x1="520" y1="639" x2="520" y2="660" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- 16. α_ffn → From-Depth Init [residual] -->
+  <path d="M780,639 C780,649 520,649 520,660" fill="none" stroke="#2ea043" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arr-r)" opacity="0.7"/>
+  <!-- 17. From-Depth Init → Final RMSNorm [normal] -->
+  <line x1="520" y1="696" x2="520" y2="735" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- 18. Final RMSNorm → LM Head [normal] -->
+  <line x1="520" y1="775" x2="520" y2="800" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- 19. LM Head → Softcap + Loss [normal] -->
+  <line x1="520" y1="840" x2="520" y2="865" stroke="#30363d" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- ═══════════════ NODES ═══════════════ -->
+
+  <!-- Input Tokens [c-io] -->
+  <rect x="420" y="30" width="200" height="42" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text class="t" x="520" y="47">Input Tokens</text>
+  <text class="s" x="520" y="61">[B, S]  int32</text>
+
+  <!-- Token Embedding [c-embed] -->
+  <rect x="314" y="94" width="196" height="44" rx="8" fill="#0d2137" stroke="#1f6feb" stroke-width="1.5"/>
+  <text class="t" x="412" y="112">Token Embedding</text>
+  <text class="s" x="412" y="126">vocab → d_model  |  no tie</text>
+
+  <!-- Value Embedding [c-special] -->
+  <rect x="530" y="94" width="196" height="44" rx="8" fill="#1a1a2e" stroke="#6e40c9" stroke-width="1.5"/>
+  <text class="t" x="628" y="112">Value Embedding ✦</text>
+  <text class="s" x="628" y="126">shared residual  init=1e-4</text>
+
+  <!-- Smear [c-special] -->
+  <rect x="420" y="170" width="200" height="44" rx="8" fill="#1a1a2e" stroke="#6e40c9" stroke-width="1.5"/>
+  <text class="t" x="520" y="188">Smear ✦</text>
+  <text class="s" x="520" y="202">causal token mix  σ(−10)</text>
+
+  <!-- RMSNorm (pre-attn) [c-norm] -->
+  <rect x="420" y="265" width="200" height="40" rx="8" fill="#0f1f0f" stroke="#2ea043" stroke-width="1.5"/>
+  <text class="t" x="520" y="281">RMSNorm</text>
+  <text class="s" x="520" y="295">parameterless  ε=1e-6</text>
+
+  <!-- QK Norm [c-attn] -->
+  <rect x="222" y="335" width="156" height="40" rx="8" fill="#1f1b00" stroke="#d29922" stroke-width="1.5"/>
+  <text class="t" x="300" y="351">QK L2 Norm ✦</text>
+  <text class="s" x="300" y="365">scale 1.2/√d_head</text>
+
+  <!-- GQA + RoPE [c-attn] -->
+  <rect x="420" y="335" width="200" height="40" rx="8" fill="#1f1b00" stroke="#d29922" stroke-width="1.5"/>
+  <text class="t" x="520" y="351">GQA + RoPE ✦</text>
+  <text class="s" x="520" y="365">base=100k  softcap=30</text>
+
+  <!-- Logit Softcap [c-attn] -->
+  <rect x="662" y="335" width="156" height="40" rx="8" fill="#1f1b00" stroke="#d29922" stroke-width="1.5"/>
+  <text class="t" x="740" y="351">Logit Softcap ✦</text>
+  <text class="s" x="740" y="365">30·tanh(x/30)</text>
+
+  <!-- KV Cache [c-io] -->
+  <rect x="840" y="335" width="160" height="40" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text class="t" x="920" y="351">KV Cache</text>
+  <text class="s" x="920" y="365">lax.dynamic_update</text>
+
+  <!-- α_attn [c-scalar] -->
+  <rect x="130" y="405" width="140" height="36" rx="8" fill="#16161a" stroke="#656d76" stroke-width="1.5"/>
+  <text class="t" x="200" y="419">α_attn ✦</text>
+  <text class="s" x="200" y="433">per-layer scalar  init=1</text>
+
+  <!-- Backout [c-special] -->
+  <rect x="420" y="465" width="200" height="40" rx="8" fill="#1a1a2e" stroke="#6e40c9" stroke-width="1.5"/>
+  <text class="t" x="520" y="481">Backout ✦</text>
+  <text class="s" x="520" y="495">post-attn mix  σ(−10)</text>
+
+  <!-- RMSNorm (pre-ffn) [c-norm] -->
+  <rect x="420" y="530" width="200" height="40" rx="8" fill="#0f1f0f" stroke="#2ea043" stroke-width="1.5"/>
+  <text class="t" x="520" y="546">RMSNorm</text>
+  <text class="s" x="520" y="560">parameterless  ε=1e-6</text>
+
+  <!-- relu² MLP [c-ffn] -->
+  <rect x="420" y="595" width="200" height="44" rx="8" fill="#1a0f1f" stroke="#bc8cff" stroke-width="1.5"/>
+  <text class="t" x="520" y="613">relu² MLP ✦</text>
+  <text class="s" x="520" y="627">h = x·relu(x)  d_ff=4d</text>
+
+  <!-- α_ffn [c-scalar] -->
+  <rect x="710" y="595" width="140" height="44" rx="8" fill="#16161a" stroke="#656d76" stroke-width="1.5"/>
+  <text class="t" x="780" y="613">α_ffn ✦</text>
+  <text class="s" x="780" y="627">per-layer scalar  init=1</text>
+
+  <!-- From-Depth Init [c-scalar] -->
+  <rect x="420" y="660" width="200" height="36" rx="8" fill="#16161a" stroke="#656d76" stroke-width="1.5"/>
+  <text class="t" x="520" y="674">From-Depth Init ✦</text>
+  <text class="s" x="520" y="688">1/√(2·(L+1))</text>
+
+  <!-- Final RMSNorm [c-norm] -->
+  <rect x="420" y="735" width="200" height="40" rx="8" fill="#0f1f0f" stroke="#2ea043" stroke-width="1.5"/>
+  <text class="t" x="520" y="751">Final RMSNorm</text>
+  <text class="s" x="520" y="765">parameterless</text>
+
+  <!-- LM Head [c-embed] -->
+  <rect x="420" y="800" width="200" height="40" rx="8" fill="#0d2137" stroke="#1f6feb" stroke-width="1.5"/>
+  <text class="t" x="520" y="816">LM Head</text>
+  <text class="s" x="520" y="830">d_model → vocab  untied</text>
+
+  <!-- Softcap + Loss [c-loss] -->
+  <rect x="420" y="865" width="200" height="42" rx="8" fill="#1f0d0d" stroke="#f85149" stroke-width="1.5"/>
+  <text class="t" x="520" y="882">Softcap + CE Loss</text>
+  <text class="s" x="520" y="896">z-loss · label-smooth</text>
+
+  <!-- ═══════════════ LEGEND ═══════════════ -->
+  <g transform="translate(848,734)">
+    <rect x="-8" y="-8" width="182" height="168" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <!-- I/O -->
+    <rect x="0" y="0"   width="14" height="14" rx="3" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+    <text class="ui" x="22" y="7"  font-size="11" fill="#8b949e" dominant-baseline="central">I/O</text>
+    <!-- Embedding -->
+    <rect x="0" y="22"  width="14" height="14" rx="3" fill="#0d2137" stroke="#1f6feb" stroke-width="1.5"/>
+    <text class="ui" x="22" y="29" font-size="11" fill="#8b949e" dominant-baseline="central">Embedding</text>
+    <!-- nanochat only -->
+    <rect x="0" y="44"  width="14" height="14" rx="3" fill="#1a1a2e" stroke="#6e40c9" stroke-width="1.5"/>
+    <text class="ui" x="22" y="51" font-size="11" fill="#8b949e" dominant-baseline="central">✦ nanochat only</text>
+    <!-- Norm -->
+    <rect x="0" y="66"  width="14" height="14" rx="3" fill="#0f1f0f" stroke="#2ea043" stroke-width="1.5"/>
+    <text class="ui" x="22" y="73" font-size="11" fill="#8b949e" dominant-baseline="central">Norm</text>
+    <!-- Attention -->
+    <rect x="0" y="88"  width="14" height="14" rx="3" fill="#1f1b00" stroke="#d29922" stroke-width="1.5"/>
+    <text class="ui" x="22" y="95" font-size="11" fill="#8b949e" dominant-baseline="central">Attention</text>
+    <!-- FFN -->
+    <rect x="0" y="110" width="14" height="14" rx="3" fill="#1a0f1f" stroke="#bc8cff" stroke-width="1.5"/>
+    <text class="ui" x="22" y="117" font-size="11" fill="#8b949e" dominant-baseline="central">FFN</text>
+    <!-- Loss -->
+    <rect x="0" y="132" width="14" height="14" rx="3" fill="#1f0d0d" stroke="#f85149" stroke-width="1.5"/>
+    <text class="ui" x="22" y="139" font-size="11" fill="#8b949e" dominant-baseline="central">Loss</text>
+  </g>
+
+  <!-- ═══════════════ CREDITS ═══════════════ -->
+  <text class="ui" x="520" y="930" text-anchor="middle" font-size="10" fill="#30363d">nanochat-jax · AI GDE TPU Sprint 2026 · Supported by Google TPU Research Cloud</text>
+</svg>

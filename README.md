@@ -40,6 +40,8 @@ If you want to understand how nanochat works internally, or run your own scaling
 
 ## Architecture
 
+![nanochat-jax Architecture](docs/architecture.svg)
+
 > **[Interactive D3.js diagram →](docs/architecture.html)** — open in a browser, hover each block for implementation details.
 
 ```
@@ -114,7 +116,7 @@ Token Embedding                 Value Embedding ✦
 ## Install
 
 ```bash
-git clone https://github.com/your-org/nanochat-jax
+git clone https://github.com/ainaomotayo/nanochat-jax
 cd nanochat-jax
 pip install -e ".[dev]"
 ```

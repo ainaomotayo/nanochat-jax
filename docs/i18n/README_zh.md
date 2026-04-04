@@ -55,7 +55,7 @@ L = 3.29 × N^(−0.027)   [TinyShakespeare，字符级，600 步]
 ## 安装
 
 ```bash
-git clone https://github.com/your-org/nanochat-jax
+git clone https://github.com/ainaomotayo/nanochat-jax
 cd nanochat-jax
 pip install -e ".[dev]"
 
