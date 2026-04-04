@@ -1,65 +1,128 @@
-"""Distributed training utilities for JAX."""
+"""Distributed training utilities for JAX.
+
+Provides mesh creation, batch sharding, and partition specs for data-
+and model-parallel training.  All functions are designed as no-ops on a
+single device so that the same training loop works unchanged on a
+laptop or a multi-device pod.
+"""
+
 from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import structlog
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
 from nanochat.config import ModelConfig
+from nanochat.core.device import make_mesh
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 
-def create_device_mesh(
+@dataclass
+class DistributedConfig:
+    """Configuration produced by :func:`setup_distributed`.
+
+    Attributes:
+        mesh: The JAX device mesh.
+        data_axis: Name of the data-parallel mesh axis.
+        model_axis: Name of the model-parallel mesh axis.
+    """
+
+    mesh: Mesh = field(repr=False)
+    data_axis: str = "data"
+    model_axis: str = "model"
+
+
+def setup_distributed(
     mesh_shape: tuple[int, int] | None = None,
-    axis_names: tuple[str, str] = ("data", "model"),
-) -> Mesh:
-    """Create a 2D JAX device mesh for data x model parallelism.
+) -> DistributedConfig:
+    """Set up distributed training and return a config.
 
-    If mesh_shape is None, auto-factors n_devices preferring
-    more data parallelism over model parallelism.
+    Auto-selects a mesh shape when *mesh_shape* is ``None``:
+
+    ========== ============
+    n_devices  mesh (dp,mp)
+    ========== ============
+    1          (1, 1)
+    2-4        (n, 1)
+    8          (4, 2)
+    ========== ============
+
+    For single-device setups the mesh is trivial ``(1, 1)`` and all
+    sharding operations become no-ops.
 
     Args:
-        mesh_shape: (data_parallel, model_parallel) or None for auto
-        axis_names: Names for mesh dimensions
+        mesh_shape: Explicit ``(data_parallel, model_parallel)`` shape,
+            or ``None`` for automatic selection.
 
     Returns:
-        JAX Mesh object
-
-    Raises:
-        RuntimeError: If no devices available
-        ValueError: If mesh_shape doesn't match device count
+        A :class:`DistributedConfig` with the mesh ready to use.
     """
-    devices = jax.devices()
-    n_devices = len(devices)
-
-    if n_devices < 1:
-        raise RuntimeError("No JAX devices available")
+    n_devices = len(jax.devices())
 
     if mesh_shape is None:
-        # Auto-factor: prefer more data parallelism
-        dp = n_devices
-        mp = 1
-        for d in range(1, n_devices + 1):
-            if n_devices % d == 0:
-                m = n_devices // d
-                if d >= m:
-                    dp, mp = d, m
-        mesh_shape = (dp, mp)
+        if n_devices == 1:
+            mesh_shape = (1, 1)
+        elif n_devices <= 4:
+            mesh_shape = (n_devices, 1)
+        elif n_devices == 8:
+            mesh_shape = (4, 2)
+        else:
+            # General case: prefer data parallelism.
+            mp = 2 if n_devices >= 8 else 1
+            dp = n_devices // mp
+            mesh_shape = (dp, mp)
 
-    dp, mp = mesh_shape
-    if dp * mp != n_devices:
-        raise ValueError(
-            f"mesh_shape {mesh_shape} requires {dp * mp} devices, "
-            f"but {n_devices} available"
-        )
+    mesh = make_mesh(mesh_shape, axis_names=("data", "model"))
 
-    device_array = np.array(devices[:n_devices]).reshape(dp, mp)
-    mesh = Mesh(device_array, axis_names=axis_names)
+    logger.info(
+        "distributed.setup",
+        mesh_shape=mesh_shape,
+        n_devices=n_devices,
+    )
 
-    logger.info("mesh_created", shape=mesh_shape, n_devices=n_devices)
-    return mesh
+    return DistributedConfig(mesh=mesh, data_axis="data", model_axis="model")
+
+
+def shard_batch(
+    batch: dict[str, Any],
+    mesh: Mesh,
+    data_axis: str = "data",
+) -> dict[str, Any]:
+    """Shard batch arrays along the data axis.
+
+    Each array in *batch* is placed on the mesh with its leading
+    (batch) dimension partitioned across the *data_axis*.  Non-array
+    values are passed through unchanged.
+
+    For a single-device mesh this is effectively a no-op: the
+    :class:`NamedSharding` wraps the array but introduces no
+    communication or copy.
+
+    Args:
+        batch: Mapping of name to array (or scalar).
+        mesh: The device mesh from :class:`DistributedConfig`.
+        data_axis: Name of the data-parallel mesh axis.
+
+    Returns:
+        A new dict with the same keys, arrays sharded along *data_axis*.
+    """
+    sharding = NamedSharding(mesh, P(data_axis))
+
+    result: dict[str, Any] = {}
+    for key, value in batch.items():
+        if isinstance(value, (jax.Array, jnp.ndarray, np.ndarray)):
+            arr = jnp.asarray(value)
+            result[key] = jax.device_put(arr, sharding)
+        else:
+            result[key] = value
+
+    return result
 
 
 def get_partition_specs(cfg: ModelConfig) -> dict[str, P]:
