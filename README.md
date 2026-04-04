@@ -44,61 +44,6 @@ If you want to understand how nanochat works internally, or run your own scaling
 
 > **[Interactive D3.js diagram →](docs/architecture.html)** — open in a browser, hover each block for implementation details.
 
-```
-Input [B, S]
-    │
-    ├─────────────────────────────────┐
-    ▼                                 ▼
-Token Embedding                 Value Embedding ✦
-  vocab → d_model                 shared residual, init=1e-4
-    │                                 │
-    └──────────────┬──────────────────┘
-                   ▼
-               Smear ✦
-        causal token mix, σ(−10) init
-                   │
- ┌─────────────────────────────────────────────┐
- │  TransformerBlock  × L                      │
- │                                             │
- │  ┌────────────────────────────────────┐     │
- │  │  Parameterless RMSNorm             │     │
- │  │  y = x / √(mean(x²) + ε)  no γ/β  │     │
- │  └───────────────┬────────────────────┘     │
- │                  │                          │
- │  ┌───────────────▼────────────────────┐     │
- │  │  QK L2 Norm ✦  →  GQA + RoPE ✦    │     │
- │  │  scale = 1.2/√d_head               │     │
- │  │  base = 100,000                    │     │
- │  │  logit softcap  30·tanh(x/30) ✦    │     │
- │  │  sliding window attention (opt.)   │     │
- │  └───────────────┬────────────────────┘     │
- │                  │  × α_attn ✦              │
- │                  ▼          ╲               │
- │         Backout ✦    ←────── + residual     │
- │      post-attn token mix                    │
- │                  │                          │
- │  ┌───────────────▼────────────────────┐     │
- │  │  Parameterless RMSNorm             │     │
- │  └───────────────┬────────────────────┘     │
- │                  │                          │
- │  ┌───────────────▼────────────────────┐     │
- │  │  relu² MLP ✦                       │     │
- │  │  h = x · relu(x)                   │     │
- │  │  d_ff = 4 × d_model,  no bias      │     │
- │  └───────────────┬────────────────────┘     │
- │                  │  × α_ffn ✦               │
- │                  │  from-depth init ✦        │
- │                  ▼          ╲               │
- │                             + residual      │
- └─────────────────────────────────────────────┘
-                   │
-             Final RMSNorm
-                   │
-          LM Head  (untied weights ✦)
-                   │
-     CE Loss  +  optional z-loss
-```
-
 **✦ = nanochat-specific features** absent from standard GPT/LLaMA.
 
 ### Model presets
