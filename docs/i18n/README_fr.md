@@ -90,10 +90,10 @@ python scripts/train.py --model-size nano --data-path data/shakespeare_char.h5 \
 | Preset | d\_model | Couches | Têtes Q | Têtes KV | seq\_len | Paramètres |
 |--------|--------:|--------:|--------:|---------:|---------:|-----------:|
 | `nano` | 128 | 4 | 4 | 4 | 64 | ~886K |
-| `small` | 512 | 6 | 8 | 8 | 2048 | ~50M |
-| `medium` | 1024 | 12 | 16 | 8 GQA | 2048 | ~210M |
-| `large` | 2048 | 24 | 32 | 8 GQA | 4096 | ~1.5B |
-| `xlarge` | 4096 | 32 | 32 | 8 GQA | 4096 | ~7B |
+| `small` | 512 | 6 | 8 | 8 | 2048 | ~68M |
+| `medium` | 1024 | 12 | 16 | 8 GQA | 2048 | ~237M |
+| `large` | 2048 | 24 | 32 | 8 GQA | 4096 | ~1.25B |
+| `xlarge` | 4096 | 32 | 32 | 8 GQA | 4096 | ~6.03B |
 
 ---
 
