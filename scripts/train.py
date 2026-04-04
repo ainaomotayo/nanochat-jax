@@ -2,10 +2,9 @@
 """Training entry point for nanochat-jax.
 
 Usage:
-    python scripts/train.py
-    python scripts/train.py model=nano training=overfit_single
-    python scripts/train.py model=small training=chinchilla
-    python scripts/train.py training.learning_rate=1e-3 training.total_steps=5000
+    python scripts/train.py --model-size nano --use-synthetic --total-steps 50
+    python scripts/train.py --model-size nano --data-path data/shakespeare_char.h5
+    python scripts/train.py --model-size small --device gpu --dtype bfloat16
 """
 from __future__ import annotations
 
@@ -41,23 +40,36 @@ def main() -> None:
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--warmup-steps", type=int, default=None)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--optimizer", type=str, default="muon",
+                       choices=["muon", "adamw"],
+                       help="Optimizer: muon (default) or adamw")
+    parser.add_argument("--device", type=str, default="cpu",
+                       choices=["cpu", "gpu", "tpu"],
+                       help="Device backend (default: cpu)")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/")
     parser.add_argument("--eval-every", type=int, default=None)
     parser.add_argument("--save-every", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16"])
     parser.add_argument("--use-synthetic", action="store_true", default=False,
-                       help="Use synthetic data (for testing)")
+                       help="Use synthetic data (for testing, no dataset needed)")
     parser.add_argument("--data-path", type=str, default=None, help="Path to HDF5 token dataset")
     args = parser.parse_args()
+
+    # ── Device setup (must happen before any JAX computation) ──────────
+    from nanochat.core.device import setup_device
+    setup_device(args.device)
 
     # Build configs
     model_cfg = ModelConfig.for_scale(args.model_size)
     train_cfg = TrainingConfig(
         batch_size=args.batch_size or (2 if args.model_size == "nano" else 8),
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate or 3e-4,
         total_steps=args.total_steps or (200 if args.model_size == "nano" else 10000),
         warmup_steps=args.warmup_steps or (0 if args.model_size == "nano" else 100),
+        optimizer=args.optimizer,
         checkpoint_dir=args.checkpoint_dir,
         eval_every_steps=args.eval_every or 100,
         save_every_steps=args.save_every or 500,
@@ -66,8 +78,9 @@ def main() -> None:
         weight_decay=0.1 if args.model_size != "nano" else 0.0,
     )
 
-    logger.info("config", model_size=args.model_size, model=model_cfg.model_dump(),
-                training=train_cfg.model_dump())
+    logger.info("config", model_size=args.model_size, device=args.device,
+                optimizer=args.optimizer, dtype=args.dtype,
+                total_steps=train_cfg.total_steps, batch_size=train_cfg.batch_size)
 
     # Build model
     rngs = nnx.Rngs(params=args.seed, dropout=args.seed + 1)
