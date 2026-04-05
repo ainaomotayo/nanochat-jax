@@ -6,9 +6,9 @@
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 [![JAX](https://img.shields.io/badge/JAX-0.4.35+-a259ff?logo=google&logoColor=white)](https://github.com/google/jax)
-[![Flax NNX](https://img.shields.io/badge/Flax_NNX-0.10+-34a853)](https://github.com/google/flax)
+[![Flax NNX](https://img.shields.io/badge/Flax_NNX-0.12+-34a853)](https://github.com/google/flax)
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-180_passed-22c55e)](#testing)
+[![Tests](https://img.shields.io/badge/tests-17_passed-22c55e)](#testing)
 
 <br/>
 
@@ -83,6 +83,32 @@ import jax
 print(jax.devices())   # GPU, TPU, or CPU
 ```
 
+### Google Colab
+
+```python
+# Cell 1 — Clone and install
+!git clone https://github.com/ainaomotayo/nanochat-jax.git
+%cd nanochat-jax
+!pip install -e ".[dev,gpu]"
+
+# Cell 2 — Prepare data
+!mkdir -p data
+!python3 scripts/preprocess.py --dataset tinystories --output_dir data/ --tokenizer char --max_samples 200000
+
+# Cell 3 — Train on GPU
+!python3 scripts/train.py \
+    --model-size nano \
+    --data-path data/tinystories.h5 \
+    --device gpu \
+    --optimizer muon \
+    --batch-size 128 \
+    --total-steps 2000 \
+    --eval-every 200 \
+    --dtype bfloat16
+```
+
+> **Note:** Each `!` command must start at column 0 (no leading spaces). Use `%cd` instead of `!cd` to change directories persistently in Colab.
+
 ---
 
 ## Quick start
@@ -151,6 +177,9 @@ python scripts/train.py
   --batch-size   N
   --learning-rate LR
   --dtype        {float32,bfloat16}
+  --device       {cpu,gpu,tpu}
+  --optimizer    {muon,adamw}
+  --gradient-accumulation-steps N
   --checkpoint-dir DIR
   --eval-every   N
   --save-every   N
@@ -333,14 +362,13 @@ python -m pytest tests/unit/              # fast, unit only
 python -m pytest --cov=src/nanochat       # with coverage report
 ```
 
-**180 tests pass** across:
+**17 tests pass** across:
 
 | Suite | Tests |
 |-------|------:|
-| Unit — model components | 110 |
-| Unit — training / data / config | 47 |
-| Integration — train + inference | 18 |
-| Scaling — power law fit | 5 |
+| Unit — model (transformer, attention, norms) | 6 |
+| Unit — training (SFT, LoRA, optimizer) | 8 |
+| Unit — distributed / config | 3 |
 
 ---
 

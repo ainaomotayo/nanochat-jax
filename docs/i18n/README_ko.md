@@ -6,7 +6,7 @@
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 [![JAX](https://img.shields.io/badge/JAX-0.4.35+-a259ff)](https://github.com/google/jax)
-[![Flax NNX](https://img.shields.io/badge/Flax_NNX-0.10+-34a853)](https://github.com/google/flax)
+[![Flax NNX](https://img.shields.io/badge/Flax_NNX-0.12+-34a853)](https://github.com/google/flax)
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e)](../../LICENSE)
 
 <br/>
