@@ -347,9 +347,34 @@ for fragment in engine.generate("HAMLET:", max_new_tokens=200,
     print(fragment, end="", flush=True)
 ```
 
-Interactive REPL:
+Interactive CLI REPL:
 ```bash
 python scripts/chat.py --model-size nano --temperature 0.8 --max-tokens 256
+```
+
+### ChatGPT-style Web UI
+
+Serve a web chat interface that streams responses token-by-token, just like nanochat's `chat_web`:
+
+```bash
+python scripts/chat_web.py --device gpu --checkpoint checkpoints/latest
+```
+
+Then open [http://localhost:8000](http://localhost:8000) in your browser. The UI supports temperature/top-k controls, conversation history, and SSE streaming. It talks to the same OpenAI-compatible API that `scripts/serve.py` exposes.
+
+<p align="center">
+  <img src="docs/chat_web_screenshot.png" alt="nanochat-jax web chat UI" width="720" />
+</p>
+
+### OpenAI-compatible API
+
+```bash
+python scripts/serve.py --device gpu --port 8000
+
+# Then from any OpenAI client:
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hello!"}], "stream": true}'
 ```
 
 ---
@@ -386,6 +411,69 @@ python -m pytest --cov=src/nanochat       # with coverage report
 
 ---
 
+## Precision / dtype
+
+Precision is managed explicitly via the `COMPUTE_DTYPE` global in `nanochat.core.device`. No implicit `jmp` or autocast:
+
+| Hardware | Default dtype | Why |
+|----------|--------------|-----|
+| GPU (A100, H100, L4, T4) | `bfloat16` | Native bf16 tensor cores, no loss scaling needed |
+| TPU v2/v3/v4 | `bfloat16` | Native bf16 matrix units |
+| CPU / MPS | `float32` | No reduced-precision acceleration |
+
+Override with the `--dtype` flag:
+```bash
+python scripts/train.py --dtype float32   # force fp32 for debugging
+python scripts/train.py --dtype bfloat16  # force bf16
+```
+
+Model weights are stored in float32 for optimizer precision. The forward pass casts to `COMPUTE_DTYPE` via explicit `jnp.asarray(x, dtype)` calls — fully visible, no magic.
+
+---
+
+## Running on CPU
+
+The nano model preset is small enough to train on CPU in a few minutes, useful for development and testing:
+
+```bash
+python scripts/train.py \
+  --model-size nano \
+  --use-synthetic \
+  --total-steps 50 \
+  --device cpu \
+  --dtype float32
+```
+
+On Apple Silicon (MPS), JAX will use the CPU backend. For serious training, use GPU or TPU.
+
+---
+
+## Research
+
+If you want to run quick experiments, the nano and small presets are good for iteration (~5 min on GPU):
+
+```bash
+# Quick 5-minute experiment at nano scale
+python scripts/train.py \
+  --model-size nano \
+  --data-path data/tinystories.h5 \
+  --device gpu \
+  --total-steps 2000 \
+  --eval-every 200
+
+# Scaling law sweep
+python scripts/run_scaling.py --experiment scale_n
+```
+
+Key metrics to monitor:
+1. `val_loss` / `val_bpb` as a function of step and training FLOPs
+2. `tok/s` throughput and device utilisation
+3. Scaling exponent `alpha` from the power law fit
+
+The `--depth` dial from nanochat maps to `--model-size` here. Change the preset, re-run, and compare — all other hyperparameters (width, heads, LR schedule, etc.) are calculated automatically.
+
+---
+
 ## Project layout
 
 ```
@@ -397,11 +485,13 @@ nanochat-jax/
 │   ├── tokenizer/       # BaseTokenizer · CharTokenizer · BPETokenizer
 │   ├── data/            # preprocessing · dataset (HDF5) · loader · packing
 │   ├── training/        # loss · optimizer · muon · scheduler · trainer · checkpoint
-│   ├── inference/       # engine · kv_cache · sampling · chat
+│   │                    # sft_trainer · rl_trainer · lora · fp8 · distributed
+│   ├── inference/       # engine · kv_cache · sampling · chat · tools
 │   ├── evaluation/      # evaluator · metrics · throughput
 │   └── scaling/         # runner · analysis · visualization
-├── scripts/             # train.py · chat.py · evaluate.py
-│                        # run_scaling.py · preprocess_shakespeare.py
+│   ├── server/          # app (FastAPI) · ui.html (ChatGPT-style web UI)
+├── scripts/             # train.py · chat.py · chat_web.py · serve.py
+│                        # evaluate.py · run_scaling.py · sft.py · rl_train.py
 ├── tests/
 │   ├── unit/
 │   ├── integration/
@@ -444,6 +534,22 @@ python -m pytest          # all tests must pass before opening a PR
 - New behaviour → new test
 - `structlog` for all logging, not `print()`
 - Shape annotations on tensor ops: `# [B, S, D]`
+
+---
+
+## Cite
+
+If you find nanochat-jax helpful in your research:
+
+```bibtex
+@misc{nanochat-jax,
+  author = {Aina Omotayo},
+  title = {nanochat-jax: Faithful JAX/Flax NNX port of nanochat with scaling law experiments},
+  year = {2026},
+  publisher = {GitHub},
+  url = {https://github.com/ainaomotayo/nanochat-jax}
+}
+```
 
 ---
 
