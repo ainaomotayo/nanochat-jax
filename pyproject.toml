@@ -15,7 +15,7 @@ authors = [{name = "NanoChat-JAX Team"}]
 dependencies = [
     "jax>=0.4.35",
     "jaxlib>=0.4.35",
-    "flax>=0.10.0",
+    "flax>=0.12.0",
     "optax>=0.2.4",
     "orbax-checkpoint>=0.9.0",
     "tiktoken>=0.7.0",
