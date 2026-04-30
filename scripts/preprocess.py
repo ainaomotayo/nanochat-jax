@@ -131,6 +131,11 @@ def _preprocess_generic(
             str(row[spec.text_column]) for row in ds.select(range(min(10000, len(ds))))
         )
         tokenizer = _build_tokenizer("char", text_for_char=sample_text)
+        vocab_path = output_dir / f"{spec.name}_vocab.json"
+        if not vocab_path.exists():
+            output_dir.mkdir(parents=True, exist_ok=True)
+            tokenizer.save(str(vocab_path))
+            logger.info("vocab_saved", path=str(vocab_path), vocab_size=tokenizer.vocab_size)
     else:
         tokenizer = _build_tokenizer("bpe")
 

@@ -49,11 +49,21 @@ def main() -> None:
     #   vocab_size>256  → BPE (medium/large/xlarge presets)
     if cfg.vocab_size == 256:
         from nanochat.tokenizer.char import CharTokenizer
-        import string
-        # Build a full printable-ASCII vocabulary (95 chars + specials = 98 IDs)
-        all_chars = string.printable  # 100 printable ASCII chars
-        tokenizer = CharTokenizer.from_text(all_chars)
-        logger.info("tokenizer.char", vocab_size=cfg.vocab_size)
+        # Look for a saved vocab alongside the data dir or checkpoint
+        script_dir = Path(__file__).resolve().parent.parent
+        vocab_candidates = [
+            script_dir / "data" / f"{args.model_size}_vocab.json",
+            script_dir / "data" / "tinystories_vocab.json",
+            script_dir / "data" / "shakespeare_vocab.json",
+        ]
+        vocab_file = next((p for p in vocab_candidates if p.exists()), None)
+        if vocab_file:
+            tokenizer = CharTokenizer.load(vocab_file)
+            logger.info("tokenizer.char", source=str(vocab_file), vocab_size=tokenizer.vocab_size)
+        else:
+            import string
+            tokenizer = CharTokenizer.from_text(string.printable)
+            logger.warning("tokenizer.char.fallback", note="no vocab file found, using string.printable — output may be garbled if checkpoint was trained with a different vocab")
     else:
         from nanochat.tokenizer.bpe import BPETokenizer
         tokenizer = BPETokenizer.from_pretrained()
@@ -64,13 +74,15 @@ def main() -> None:
         logger.info("model.random_init", model_size=args.model_size)
         model = TransformerLM(cfg, rngs=nnx.Rngs(params=42, dropout=43))
     else:
+        from nanochat.training.checkpoint import CheckpointManager
         ckpt_path = Path(args.checkpoint)
         if not ckpt_path.exists():
             logger.error("checkpoint_not_found", path=str(ckpt_path))
             sys.exit(1)
-        logger.info("model.loading_checkpoint", path=str(ckpt_path))
         model = TransformerLM(cfg, rngs=nnx.Rngs(params=42, dropout=43))
-        logger.warning("checkpoint_loading_not_implemented", fallback="random_init")
+        ckpt_mgr = CheckpointManager(ckpt_path.parent)
+        step = ckpt_mgr.load(ckpt_path, model)
+        logger.info("model.checkpoint_loaded", path=str(ckpt_path), step=step)
 
     engine = InferenceEngine(model, tokenizer, cfg)
 
