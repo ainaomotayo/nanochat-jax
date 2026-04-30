@@ -219,8 +219,8 @@ def device_info() -> dict[str, Any]:
     return {
         "device_type": dt.value,
         "n_devices": len(devs),
-        "compute_dtype": str(COMPUTE_DTYPE),
-        "param_dtype": str(PARAM_DTYPE),
+        "compute_dtype": COMPUTE_DTYPE.__name__,
+        "param_dtype": PARAM_DTYPE.__name__,
         "jax_version": jax.__version__,
         "devices": [str(d) for d in devs[:4]],  # cap for readability
     }

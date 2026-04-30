@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>nanochat-jax</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
 <style>
   :root {
     --bg: #0d1117;
@@ -208,7 +209,7 @@
     <label>Temp: <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.8">
       <span id="temp-val">0.8</span></label>
     <label>Top-k: <input type="number" id="top-k" min="0" max="500" value="50" style="width:50px"></label>
-    <label>Max tokens: <input type="number" id="max-tokens" min="1" max="4096" value="256" style="width:60px"></label>
+    <label>Max tokens: <input type="number" id="max-tokens" min="1" max="4096" value="64" style="width:60px"></label>
     <button id="clear-btn" onclick="clearChat()">Clear</button>
   </div>
   <form id="input-form" onsubmit="sendMessage(event)">
@@ -299,10 +300,11 @@ async function sendMessage(e) {
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let done = false;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    while (!done) {
+      const { done: streamDone, value } = await reader.read();
+      if (streamDone) break;
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
@@ -311,7 +313,7 @@ async function sendMessage(e) {
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         const data = line.slice(6);
-        if (data === '[DONE]') break;
+        if (data === '[DONE]') { done = true; break; }
 
         try {
           const chunk = JSON.parse(data);
