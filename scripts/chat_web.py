@@ -40,13 +40,27 @@ def main() -> None:
     from flax import nnx
     from nanochat.config import ModelConfig
     from nanochat.model.transformer import TransformerLM
-    from nanochat.tokenizer.bpe import BPETokenizer
     from nanochat.inference.engine import InferenceEngine
 
     cfg = ModelConfig.for_scale(args.model_size)
-    tokenizer = BPETokenizer.from_pretrained()
 
-    if args.checkpoint == "RANDOM":
+    # Pick tokenizer to match model vocab size:
+    #   vocab_size=256  → char-level (nano/small char presets)
+    #   vocab_size>256  → BPE (medium/large/xlarge presets)
+    if cfg.vocab_size == 256:
+        from nanochat.tokenizer.char import CharTokenizer
+        import string
+        # Build a full printable-ASCII vocabulary (95 chars + specials = 98 IDs)
+        all_chars = string.printable  # 100 printable ASCII chars
+        tokenizer = CharTokenizer.from_text(all_chars)
+        logger.info("tokenizer.char", vocab_size=cfg.vocab_size)
+    else:
+        from nanochat.tokenizer.bpe import BPETokenizer
+        tokenizer = BPETokenizer.from_pretrained()
+        logger.info("tokenizer.bpe", vocab_size=cfg.vocab_size)
+
+    random_weights = args.checkpoint == "RANDOM"
+    if random_weights:
         logger.info("model.random_init", model_size=args.model_size)
         model = TransformerLM(cfg, rngs=nnx.Rngs(params=42, dropout=43))
     else:
@@ -65,6 +79,11 @@ def main() -> None:
     from fastapi.responses import HTMLResponse
 
     app = create_app(engine)
+
+    # Expose random_weights status for UI banner
+    @app.get("/status")
+    def status():
+        return {"random_weights": random_weights, "model_size": args.model_size}
 
     # Serve the chat UI at root
     ui_path = Path(__file__).resolve().parent.parent / "src" / "nanochat" / "server" / "ui.html"

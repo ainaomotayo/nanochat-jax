@@ -195,6 +195,10 @@
   <h1><span>nanochat</span>-jax</h1>
   <div class="header-info" id="model-info">Loading...</div>
 </header>
+<div id="random-banner" style="display:none;background:#7c2d12;color:#fed7aa;padding:8px 24px;font-size:13px;text-align:center;">
+  ⚠️ Running on <strong>random weights</strong> — responses are noise. Train a model first:
+  <code style="background:#431407;padding:2px 6px;border-radius:4px;margin-left:6px;">python scripts/train.py --model-size nano --data-path data/tinystories.h5 --device gpu</code>
+</div>
 
 <div id="chat-container">
   <div class="welcome" id="welcome">
@@ -233,10 +237,16 @@ let generating = false;
 
 tempSlider.oninput = () => tempVal.textContent = tempSlider.value;
 
-// Fetch model info on load
+// Fetch model info and status on load
 fetch('/health').then(r => r.json()).then(info => {
   modelInfo.textContent = `${info.device_type || 'unknown'} | ${info.compute_dtype || 'float32'}`;
 }).catch(() => { modelInfo.textContent = 'connected'; });
+
+fetch('/status').then(r => r.json()).then(s => {
+  if (s.random_weights) {
+    document.getElementById('random-banner').style.display = 'block';
+  }
+}).catch(() => {});
 
 function addMessage(role, content) {
   const welcome = document.getElementById('welcome');
